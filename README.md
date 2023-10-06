@@ -31,7 +31,7 @@ WINEDEBUG="+msync"
 
 Please report any discovered bugs. A primary aim for ```msync``` was to enhance performance over simulated ```eventfd``` objects on macOS. If ```esync``` has better performance in any situation, that's considered a bug.
 
-For incorrect behaviour logs with at least ```+seh,+pid,+msync,+timestamp``` are much apprciated.
+For incorrect behaviour logs with at least ```+seh,+pid,+msync,+timestamp``` are much appreciated.
 
 For optimal performance, ```msync``` directly calls into ```mach_msg2_trap```, meaning macOS 12.0 or newer is required.
 
