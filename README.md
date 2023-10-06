@@ -53,3 +53,6 @@ System: M2 Max with a CX23 based wine build.
 
 Contributions to ```msync``` are welcome, be it in the form of optimizations, bug fixes, or wine rebases.
 
+## License & Integration
+
+```msync``` is released under the GPL v3 license, and integration into other open-source projects is encouraged. If you decide to use or integrate ```msync``` into your projects, although not mandatory, a mention or acknowledgment would be appreciated.
