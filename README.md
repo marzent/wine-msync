@@ -33,7 +33,7 @@ Please report any discovered bugs. A primary aim for ```msync``` was to enhance 
 
 For incorrect behaviour logs with at least ```+seh,+pid,+msync,+timestamp``` are much apprciated.
 
-For optimal performance, ```msync``` directly calls into ```mach_msg2_trap```, meaning macOS 12.0 or a newer is required.
+For optimal performance, ```msync``` directly calls into ```mach_msg2_trap```, meaning macOS 12.0 or newer is required.
 
 ## Benchmarks
 
