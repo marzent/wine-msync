@@ -47,7 +47,7 @@ System: M2 Max with a CX23 based wine build.
 
 ## Acknowledgements
 
-```msync``` was inspired by ```esync/fsync``` and the awesome work done by Zebediah Figura on that matter.
+```msync``` was inspired by ```esync```/```fsync``` and the awesome work done by Zebediah Figura on that matter.
 
 ## Contribute
 
