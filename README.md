@@ -7,7 +7,7 @@ It draws inspiration from ```esync``` and ```fsync```, particularly relying on s
 ## Features
 * **Efficient Wait Operation:** Uncontended waits happen completely in user-space, with a dedicated Mach message pump handling all waiting synchronization tasks.
 * **No File Descriptor Limitations**: Unlike ```esync```, ```msync``` does not have file descriptor limitations.
-* **Dynamic Semaphore Pool**: Semaphores are sourced from a pool that dynamically adjusts based on application needs. With a high semaphore per process limit of 267,597, it is unlikely for processes to be terminated by the kernel due to exceeding this number. Even in such cases, only the faulty process is affected, ensuring ```wineserver``` or other Wine processes remain uninterrupted.
+* **Dynamic Semaphore Pool**: Semaphores are sourced from a pool that dynamically adjusts based on application needs. With a high semaphore per process limit of 267597, it is unlikely for processes to be terminated by the kernel due to exceeding this number. Even in such cases, only the faulty process is affected, ensuring ```wineserver``` or other Wine processes remain uninterrupted.
 
 
 ## How to Use
