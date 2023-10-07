@@ -4864,3 +4864,41 @@ index 7692fbe3ed2..2ffbb510862 100644
 -- 
 2.39.2 (Apple Git-144)
 
+
+From 2d27e022e8a17a834b9a809a3eb18623896af241 Mon Sep 17 00:00:00 2001
+From: Marc-Aurel Zent <marc_aurel@me.com>
+Date: Sat, 7 Oct 2023 04:32:11 +0200
+Subject: [PATCH] fix build warnings
+
+---
+ dlls/ntdll/unix/msync.c | 1 +
+ server/msync.c          | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
+index 643fbd73dd5..1d144b70166 100644
+--- a/dlls/ntdll/unix/msync.c
++++ b/dlls/ntdll/unix/msync.c
+@@ -46,6 +46,7 @@
+ # include <mach/port.h>
+ # include <mach/task.h>
+ # include <mach/semaphore.h>
++# include <mach/error.h>
+ # include <servers/bootstrap.h>
+ #endif
+ #include <sched.h>
+diff --git a/server/msync.c b/server/msync.c
+index d919b5b8c0a..11a6da410cb 100644
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -37,6 +37,7 @@
+ # include <mach/port.h>
+ # include <mach/task.h>
+ # include <mach/semaphore.h>
++# include <mach/error.h>
+ # include <servers/bootstrap.h>
+ #endif
+ #include <sched.h>
+-- 
+2.39.2 (Apple Git-144)
+
