@@ -5107,3 +5107,95 @@ index ad777cea..719e6ee8 100644
 -- 
 2.39.2 (Apple Git-144)
 
+
+From 0dd5df0179270e5d0af3c579ad81ede475517422 Mon Sep 17 00:00:00 2001
+From: Marc-Aurel Zent <marc_aurel@me.com>
+Date: Sat, 7 Oct 2023 21:47:01 +0200
+Subject: [PATCH 1/2] set message thread qos
+
+---
+ server/msync.c | 43 ++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/server/msync.c b/server/msync.c
+index 719e6ee8..e96b0b29 100644
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -394,7 +394,6 @@ static void *mach_message_pump( void *args )
+             mach_unregister_message = (mach_unregister_message_t *)&receive_message;
+             for (i = 0; i < count; i++)
+                 remove_sem_from_map( mach_unregister_message->shm_idx[i], tid );
+-                
+ 
+             continue;
+         }
+@@ -457,12 +456,47 @@ static void cleanup(void)
+         perror( "shm_unlink" );
+ }
+ 
++static void set_thread_policy_qos( mach_port_t mach_thread_id )
++{
++    thread_extended_policy_data_t extended_policy;
++    thread_precedence_policy_data_t precedence_policy;
++    int throughput_qos, latency_qos;
++    kern_return_t kr;
++
++    latency_qos = LATENCY_QOS_TIER_5;
++    kr = thread_policy_set( mach_thread_id, THREAD_LATENCY_QOS_POLICY,
++                            (thread_policy_t)&latency_qos,
++                            THREAD_LATENCY_QOS_POLICY_COUNT);
++    if (kr != KERN_SUCCESS)
++        fprintf(stderr, "msync: error setting thread latency QoS.");
++
++    throughput_qos = THROUGHPUT_QOS_TIER_5;
++    kr = thread_policy_set( mach_thread_id, THREAD_THROUGHPUT_QOS_POLICY,
++                            (thread_policy_t)&throughput_qos,
++                            THREAD_THROUGHPUT_QOS_POLICY_COUNT);
++    if (kr != KERN_SUCCESS)
++        fprintf(stderr, "msync: error setting thread throughput QoS.");
++
++    extended_policy.timeshare = 0;
++    kr = thread_policy_set( mach_thread_id, THREAD_EXTENDED_POLICY,
++                            (thread_policy_t)&extended_policy,
++                            THREAD_EXTENDED_POLICY_COUNT );
++    if (kr != KERN_SUCCESS)
++        fprintf( stderr, "msync: error setting extended policy\n" );
++
++    precedence_policy.importance = 63;
++    kr = thread_policy_set( mach_thread_id, THREAD_PRECEDENCE_POLICY,
++                            (thread_policy_t)&precedence_policy,
++                            THREAD_PRECEDENCE_POLICY_COUNT );
++    if (kr != KERN_SUCCESS)
++        fprintf( stderr, "msync: error setting precedence policy\n" );
++}
++
+ void msync_init(void)
+ {
+ #ifdef __APPLE__
+     struct stat st;
+     mach_port_t bootstrap_port;
+-    pthread_attr_t attr;
+     mach_port_limits_t limits;
+ 
+     if (fstat( config_dir_fd, &st ) == -1)
+@@ -512,15 +546,14 @@ void msync_init(void)
+     
+     pool_init();
+ 
+-    pthread_attr_init(&attr);
+-    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+-
+     if (pthread_create( &message_thread, NULL, mach_message_pump, NULL ))
+     {
+         perror("pthread_create");
+         fatal_error( "could not create mach message pump thread\n" );
+     }
+ 
++    set_thread_policy_qos( pthread_mach_thread_np( message_thread )) ;
++
+     fprintf( stderr, "msync: bootstrapped mach port on %s.\n", shm_name + 1 );
+ 
+     is_msync_initialized = 1;
+-- 
+2.39.2 (Apple Git-144)
+
