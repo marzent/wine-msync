@@ -33,7 +33,7 @@ Please report any discovered bugs. A primary aim for ```msync``` was to enhance 
 
 For incorrect behaviour logs with at least ```+seh,+pid,+msync,+timestamp``` are much appreciated.
 
-For optimal performance, ```msync``` directly calls into ```mach_msg2_trap```, meaning macOS 12.0 or newer is required.
+For optimal performance, ```msync``` directly calls into ```mach_msg2_trap```, meaning macOS 13.0 or newer is required.
 
 ## Benchmarks
 
@@ -42,7 +42,7 @@ System: M2 Max with a CX23 based wine build.
 |Test Description|msync|esync|Server-side sync|
 |---|---|---|---|
 |Contended wait (10000000 iterations, 2 threads)|5.891094 seconds|7.423686 seconds|&gt; 170 seconds|
-|Uncontended wait (2 seconds timeout, 2 threads)|270545 iterations|222675 iterations|60309 iterations|
+|zigzag test (2 seconds timeout, 2 threads)|270545 iterations|222675 iterations|60309 iterations|
 |FFXIV indoors, CPU bound|170 FPS|145 FPS|93 FPS|
 
 ## Acknowledgements
