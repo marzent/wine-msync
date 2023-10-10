@@ -5393,3 +5393,258 @@ index e96b0b29..f79d6e7a 100644
 -- 
 2.39.2 (Apple Git-144)
 
+
+From 3b2c3c1f8c1c5d8b0ba16ea96bfb54933d6b9bf5 Mon Sep 17 00:00:00 2001
+From: Marc-Aurel Zent <marc_aurel@me.com>
+Date: Tue, 10 Oct 2023 10:48:39 +0200
+Subject: [PATCH 1/1] use lock-free sem_list
+
+---
+ server/msync.c | 110 +++++++++++++++++++++----------------------------
+ 1 file changed, 46 insertions(+), 64 deletions(-)
+
+diff --git a/server/msync.c b/server/msync.c
+index f79d6e7a..6da7cdd1 100644
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -129,49 +129,28 @@ struct sem_list
+ {
+     struct sem_node *head;
+     int is_used;
+-    volatile int lock;
+ };
+ 
+-static inline void small_pause(void)
+-{
+-#if defined(__i386__) || defined(__x86_64__)
+-    __asm__ __volatile__( "rep;nop" : : : "memory" );
+-#else
+-    __asm__ __volatile__( "" : : : "memory" );
+-#endif
+-}
+-
+-static inline void spinlock_lock( volatile int *lock )
+-{
+-    while(__atomic_test_and_set(lock, __ATOMIC_ACQUIRE))
+-        while(__atomic_load_n(lock, __ATOMIC_RELAXED))
+-            small_pause();
+-}
+-
+-static inline void spinlock_unlock( volatile int *lock )
+-{
+-    __atomic_clear(lock, __ATOMIC_RELEASE);
+-}
++static struct sem_list mach_semaphore_map[MAX_INDEX];
+ 
+-static inline void add_sem( struct sem_list *list, semaphore_t sem, int tid )
++static inline void add_sem( unsigned int shm_idx, semaphore_t sem, int tid )
+ {
+     struct sem_node *new_node;
++    struct sem_list *list = mach_semaphore_map + shm_idx;
+ 
+     new_node = pool_alloc();
+     new_node->sem = sem;
+     new_node->tid = tid;
+ 
+-    spinlock_lock(&list->lock);
+     new_node->next = list->head;
+     list->head = new_node;
+-    spinlock_unlock(&list->lock);
+ }
+ 
+-static inline void remove_sem( struct sem_list *list, int tid )
++static inline void remove_sem( unsigned int shm_idx, int tid )
+ {
+     struct sem_node *current, *prev = NULL;
++    struct sem_list *list = mach_semaphore_map + shm_idx;
+ 
+-    spinlock_lock(&list->lock);
+     current = list->head;
+     while (current != NULL)
+     {
+@@ -187,18 +166,16 @@ static inline void remove_sem( struct sem_list *list, int tid )
+         prev = current;
+         current = current->next;
+     }
+-    spinlock_unlock(&list->lock);
+ }
+ 
+-static inline void destroy_all( struct sem_list *list )
++static inline void destroy_all_internal( unsigned int shm_idx )
+ {
+-    struct sem_node *temp, *current;
++    struct sem_node *current, *temp;
++    struct sem_list *list = mach_semaphore_map + shm_idx;
+ 
+-    spinlock_lock(&list->lock);
+     current = list->head;
+     list->head = NULL;
+-    list->is_used = 0;
+-    spinlock_unlock(&list->lock);
++    __atomic_store_n( &list->is_used, 0, __ATOMIC_SEQ_CST );
+ 
+     while (current)
+     {
+@@ -209,17 +186,13 @@ static inline void destroy_all( struct sem_list *list )
+     }
+ }
+ 
+-static struct sem_list mach_semaphore_map[MAX_INDEX];
+-
+-static void signal_all_internal( unsigned int shm_idx )
++static inline void signal_all_internal( unsigned int shm_idx )
+ {
+     struct sem_node *current, *temp;
+     struct sem_list *list = mach_semaphore_map + shm_idx;
+ 
+-    spinlock_lock(&list->lock);
+     current = list->head;
+     list->head = NULL;
+-    spinlock_unlock(&list->lock);
+ 
+     while (current)
+     {
+@@ -231,13 +204,15 @@ static void signal_all_internal( unsigned int shm_idx )
+     }
+ }
+ 
+-/* thread-safe sequentially consistent guarantees relative to register/unregister
+- * are made by the mach messaging queue */
+-static inline mach_msg_return_t signal_all( unsigned int shm_idx )
++/*
++ * thread-safe sequentially consistent guarantees relative to register/unregister
++ * client-side are made by the mach messaging queue
++ */
++static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
+ {
+-    __thread static mach_msg_header_t send_header;
++    static mach_msg_header_t send_header;
+     send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
+-    send_header.msgh_id = shm_idx;
++    send_header.msgh_id = shm_idx | (1 << 19);
+     send_header.msgh_size = sizeof(send_header);
+     send_header.msgh_remote_port = receive_port;
+     
+@@ -245,14 +220,16 @@ static inline mach_msg_return_t signal_all( unsigned int shm_idx )
+                 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
+ }
+ 
+-static inline void add_sem_to_map( unsigned int index, semaphore_t sem, int tid )
+-{
+-    add_sem( mach_semaphore_map + index, sem, tid );
+-}
+-
+-static inline void remove_sem_from_map( unsigned int index, int tid )
++static inline mach_msg_return_t signal_all( unsigned int shm_idx )
+ {
+-    remove_sem( mach_semaphore_map + index, tid );
++    static mach_msg_header_t send_header;
++    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
++    send_header.msgh_id = shm_idx;
++    send_header.msgh_size = sizeof(send_header);
++    send_header.msgh_remote_port = receive_port;
++    
++    return mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size,
++                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
+ }
+ 
+ typedef struct
+@@ -285,11 +262,11 @@ static inline void decode_msgh_id( unsigned int msgh_id, unsigned int *tid, unsi
+     *count = msgh_id & 0xFF;
+ }
+ 
+-static inline unsigned int check_if_mutex(unsigned int *shm_idx)
++static inline unsigned int check_bit_20( unsigned int *shm_idx )
+ {
+-    unsigned int is_mutex = (*shm_idx >> 19) & 1;
++    unsigned int bit_20 = (*shm_idx >> 19) & 1;
+     *shm_idx &= ~(1 << 19);
+-    return is_mutex;
++    return bit_20;
+ }
+ 
+ static void *mach_message_pump( void *args )
+@@ -316,12 +293,17 @@ static void *mach_message_pump( void *args )
+         }
+ 
+         /*
+-         * A message with no body is a signal_all operation where the shm_idx is the msgh_id.
+-         * See signal_all( unsigned int shm_idx ) above.
++         * A message with no body is a signal_all or destroy_all operation where the shm_idx
++         * is the msgh_id and the type of operation is decided by the 20th bit.
++         * (The shared memory index is only a 19-bit integer at max)
++         * See signal_all( unsigned int shm_idx ) and destroy_all( unsigned int shm_idx )above.
+          */
+         if (receive_message.header.msgh_size == sizeof(mach_msg_header_t))
+         {
+-            signal_all_internal( receive_message.header.msgh_id );
++            if (check_bit_20( (unsigned int *)&receive_message.header.msgh_id ))
++                destroy_all_internal( receive_message.header.msgh_id );
++            else
++                signal_all_internal( receive_message.header.msgh_id );
+             continue;
+         }
+ 
+@@ -334,7 +316,7 @@ static void *mach_message_pump( void *args )
+         {
+             mach_unregister_message = (mach_unregister_message_t *)&receive_message;
+             for (i = 0; i < count; i++)
+-                remove_sem_from_map( mach_unregister_message->shm_idx[i], tid );
++                remove_sem( mach_unregister_message->shm_idx[i], tid );
+ 
+             continue;
+         }
+@@ -345,7 +327,7 @@ static void *mach_message_pump( void *args )
+         sem = receive_message.descriptor.name;
+         for (i = 0; i < count; i++)
+         {
+-            is_mutex = check_if_mutex( receive_message.shm_idx + i );
++            is_mutex = check_bit_20( receive_message.shm_idx + i );
+             addr = (int *)get_shm( receive_message.shm_idx[i] );
+             val = __atomic_load_n( addr, __ATOMIC_SEQ_CST );
+             if ((is_mutex && (val == 0 || val == ~0 || val == tid)) || (!is_mutex && val != 0))
+@@ -355,7 +337,7 @@ static void *mach_message_pump( void *args )
+                 semaphore_destroy( mach_task_self(), sem );
+                 continue;
+             }
+-            add_sem_to_map( receive_message.shm_idx[i], sem, tid );
++            add_sem( receive_message.shm_idx[i], sem, tid );
+         }
+     }
+ 
+@@ -631,18 +613,18 @@ unsigned int msync_alloc_shm( int low, int high )
+ 
+     shm_idx = shm_idx_counter;
+ 
+-    while (mach_semaphore_map[shm_idx].is_used)
++    while (__atomic_load_n( &mach_semaphore_map[shm_idx].is_used, __ATOMIC_SEQ_CST ))
+     {
+         shm_idx = (shm_idx + 1) % MAX_INDEX;
+         if (tries++ > MAX_INDEX)
+         {
+-            /* The ftruncate call can only be succesfully done with a non-zero length
++            /* The ftruncate call can only be successfully done with a non-zero length
+              * once per shared memory region with XNU. We need to terminate now.
+-             * Also we initialized with the default maximum size anyways... */
+-            fatal_error( "too many msync objects\n" );
++             * Also, we initialized with the default maximum size anyways... */
++            fatal_error("too many msync objects\n");
+         }
+     }
+-    mach_semaphore_map[shm_idx].is_used = 1;
++    __atomic_store_n( &mach_semaphore_map[shm_idx].is_used, 1, __ATOMIC_SEQ_CST );
+     assert(mach_semaphore_map[shm_idx].head == NULL);
+     shm_idx_counter = (shm_idx + 1) % MAX_INDEX;
+ 
+@@ -743,7 +725,7 @@ void msync_destroy_semaphore( unsigned int shm_idx )
+ {
+     if (!shm_idx) return;
+ 
+-    destroy_all( mach_semaphore_map + shm_idx );
++    destroy_all( shm_idx );
+ }
+ 
+ void msync_clear_shm( unsigned int shm_idx )
+-- 
+2.39.2 (Apple Git-144)
+
