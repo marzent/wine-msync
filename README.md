@@ -27,7 +27,7 @@ WINEMSYNC_QLIMIT=50
 WINEDEBUG="+msync"
 ```
 
-## Bugs and Limitations
+## Bugs
 
 Please report any discovered bugs. A primary aim for ```msync``` was to enhance performance over simulated ```eventfd``` objects on macOS. If ```esync``` has better performance in any situation, that's considered a bug.
 
@@ -53,4 +53,4 @@ Contributions to ```msync``` are welcome, be it in the form of optimizations, bu
 
 ## License & Integration
 
-```msync``` is released under the GPL v3 license, and integration into other open-source projects is encouraged. If you decide to use or integrate ```msync``` into your projects, although not mandatory, a mention or acknowledgment would be appreciated.
+```msync``` is released under the GPL v3 license, and integration into other open-source projects is very welcome. If you decide to use or integrate ```msync``` into your projects, although not mandatory, a mention or acknowledgment would be appreciated.
