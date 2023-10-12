@@ -5654,3 +5654,48 @@ index f79d6e7a..6da7cdd1 100644
 -- 
 2.39.2 (Apple Git-144)
 
+
+From 2f134969dd9a80185ad9a38e021c9ba0b1303d3a Mon Sep 17 00:00:00 2001
+From: Marc-Aurel Zent <marc_aurel@me.com>
+Date: Thu, 12 Oct 2023 12:49:18 +0200
+Subject: [PATCH] fix headers
+
+---
+ dlls/ntdll/unix/msync.c | 2 +-
+ server/msync.c          | 4 +++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
+index 3b9b2aa7..b34d599f 100644
+--- a/dlls/ntdll/unix/msync.c
++++ b/dlls/ntdll/unix/msync.c
+@@ -46,7 +46,7 @@
+ # include <mach/port.h>
+ # include <mach/task.h>
+ # include <mach/semaphore.h>
+-# include <mach/error.h>
++# include <mach/mach_error.h>
+ # include <servers/bootstrap.h>
+ # include <os/lock.h>
+ #endif
+diff --git a/server/msync.c b/server/msync.c
+index 185e1306..d673ce60 100644
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -37,10 +37,12 @@
+ # include <mach/port.h>
+ # include <mach/task.h>
+ # include <mach/semaphore.h>
+-# include <mach/error.h>
++# include <mach/mach_error.h>
++# include <mach/thread_act.h>
+ # include <servers/bootstrap.h>
+ #endif
+ #include <sched.h>
++#include <signal.h>
+ #include <pthread.h>
+ #include <unistd.h>
+ 
+-- 
+2.39.2 (Apple Git-144)
+
