@@ -4771,3 +4771,325 @@ index 7692fbe3ed2..2ffbb510862 100644
 -- 
 2.39.2 (Apple Git-144)
 
+
+From d9afdf1983020bc25e12a8ac0f2898c774138113 Mon Sep 17 00:00:00 2001
+From: Marc-Aurel Zent <marc_aurel@me.com>
+Date: Fri, 13 Oct 2023 18:27:59 +0200
+Subject: [PATCH] load mach_msg2 dynamically
+
+---
+ dlls/ntdll/unix/msync.c | 97 +++++++++++++++++++++++++++++++++++++----
+ server/msync.c          | 96 ++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 175 insertions(+), 18 deletions(-)
+
+diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
+index b34d599f..861879ab 100644
+--- a/dlls/ntdll/unix/msync.c
++++ b/dlls/ntdll/unix/msync.c
+@@ -50,6 +50,7 @@
+ # include <servers/bootstrap.h>
+ # include <os/lock.h>
+ #endif
++#include <dlfcn.h>
+ #include <sched.h>
+ #include <unistd.h>
+ 
+@@ -86,9 +87,80 @@ static inline mach_timespec_t convert_to_mach_time( LONGLONG win32_time )
+     return ret;
+ }
+ 
+-extern mach_msg_return_t mach_msg_overwrite_trap( mach_msg_header_t *msg, mach_msg_option_t option,
++/*
++ * Faster to directly do the syscall and inline everything, taken and slightly adapted
++ * from xnu/libsyscall/mach/mach_msg.c
++ */
++
++#define LIBMACH_OPTIONS64 (MACH_SEND_INTERRUPT|MACH_RCV_INTERRUPT)
++#define MACH64_SEND_MQ_CALL 0x0000000400000000ull
++
++typedef mach_msg_return_t (*mach_msg2_trap_ptr_t)( void *data, uint64_t options,
++    uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port,
++    uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout );
++
++static mach_msg2_trap_ptr_t mach_msg2_trap;
++
++static inline mach_msg_return_t mach_msg2_internal( void *data, uint64_t option64, uint64_t msgh_bits_and_send_size,
++    uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout)
++{
++    mach_msg_return_t mr;
++
++    mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++             msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++             rcv_size_and_priority, timeout );
++
++    if (mr == MACH_MSG_SUCCESS)
++        return MACH_MSG_SUCCESS;
++
++    while (mr == MACH_SEND_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout );
++
++    while (mr == MACH_RCV_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size & 0xffffffffull,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout);
++
++    return mr;
++}
++
++/* For older versions of macOS we need to provide fallback in case there is no mach_msg2... */
++extern mach_msg_return_t mach_msg_trap( mach_msg_header_t *msg, mach_msg_option_t option,
+         mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_name_t rcv_name, mach_msg_timeout_t timeout,
+-        mach_msg_priority_t priority, mach_msg_header_t *rcv_msg, mach_msg_size_t rcv_limit);
++        mach_port_name_t notify );
++
++static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t option64,
++    mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_t rcv_name, uint64_t timeout,
++    uint32_t priority)
++{
++    mach_msg_base_t *base;
++    mach_msg_size_t descriptors;
++
++    if (!mach_msg2_trap)
++        return mach_msg_trap( data, (mach_msg_option_t)option64, send_size,
++                              rcv_size, rcv_name, timeout, priority );
++
++    base = (mach_msg_base_t *)data;
++
++    if ((option64 & MACH_SEND_MSG) &&
++        (base->header.msgh_bits & MACH_MSGH_BITS_COMPLEX))
++        descriptors = base->body.msgh_descriptor_count;
++    else
++        descriptors = 0;
++
++#define MACH_MSG2_SHIFT_ARGS(lo, hi) ((uint64_t)hi << 32 | (uint32_t)lo)
++    return mach_msg2_internal(data, option64 | MACH64_SEND_MQ_CALL,
++               MACH_MSG2_SHIFT_ARGS(data->msgh_bits, send_size),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_remote_port, data->msgh_local_port),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_voucher_port, data->msgh_id),
++               MACH_MSG2_SHIFT_ARGS(descriptors, rcv_name),
++               MACH_MSG2_SHIFT_ARGS(rcv_size, priority), timeout);
++#undef MACH_MSG2_SHIFT_ARGS
++}
+ 
+ /* this is a lot, but running out cripples performance */
+ #define MAX_POOL_SEMAPHORES 1024
+@@ -278,8 +350,8 @@ static inline void server_register_wait( semaphore_t sem, unsigned int msgh_id,
+     message.prolog.header.msgh_size = sizeof(mach_register_message_prolog_t) +
+                                       count * sizeof(unsigned int);
+ 
+-    mr = mach_msg_overwrite_trap( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.prolog.header.msgh_size,
+-                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.prolog.header.msgh_size,
++                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+     
+     if (mr != MACH_MSG_SUCCESS)
+         ERR("Failed to send server register wait: %#x\n", mr);
+@@ -302,8 +374,8 @@ static inline void server_remove_wait( semaphore_t sem, unsigned int msgh_id,
+     message.header.msgh_size = sizeof(mach_msg_header_t) +
+                                count * sizeof(unsigned int);
+ 
+-    mr = mach_msg_overwrite_trap( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
+-                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
++                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+     
+     if (mr != MACH_MSG_SUCCESS)
+         ERR("Failed to send server remove wait: %#x\n", mr);
+@@ -651,6 +723,7 @@ void msync_init(void)
+ {
+     struct stat st;
+     mach_port_t bootstrap_port;
++    void *dlhandle = dlopen( NULL, RTLD_NOW );
+ 
+     if (!do_msync())
+     {
+@@ -665,6 +738,7 @@ void msync_init(void)
+             exit(1);
+         }
+ 
++        dlclose( dlhandle );
+         return;
+     }
+ 
+@@ -694,7 +768,12 @@ void msync_init(void)
+     semaphore_pool_init();
+     
+     /* Bootstrap mach wineserver communication */
+-    
++
++    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
++    if (!mach_msg2_trap)
++        WARN("Using mach_msg_overwrite instead of mach_msg2\n");
++    dlclose( dlhandle );
++
+     if (task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bootstrap_port) != KERN_SUCCESS)
+     {
+         ERR("Failed task_get_special_port\n");
+@@ -734,8 +813,8 @@ static inline void signal_all( struct msync *obj )
+     send_header.msgh_size = sizeof(send_header);
+     send_header.msgh_remote_port = server_port;
+     
+-    mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
+-              MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
++              MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+ }
+ 
+ NTSTATUS msync_release_semaphore( HANDLE handle, ULONG count, ULONG *prev )
+diff --git a/server/msync.c b/server/msync.c
+index d673ce60..f066973f 100644
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -42,6 +42,7 @@
+ # include <servers/bootstrap.h>
+ #endif
+ #include <sched.h>
++#include <dlfcn.h>
+ #include <signal.h>
+ #include <pthread.h>
+ #include <unistd.h>
+@@ -71,9 +72,80 @@
+ /* Private API to register a mach port with the bootstrap server */
+ extern kern_return_t bootstrap_register2( mach_port_t bp, name_t service_name, mach_port_t sp, int flags );
+ 
+-extern mach_msg_return_t mach_msg_overwrite_trap( mach_msg_header_t *msg, mach_msg_option_t option,
++/*
++ * Faster to directly do the syscall and inline everything, taken and slightly adapted
++ * from xnu/libsyscall/mach/mach_msg.c
++ */
++
++#define LIBMACH_OPTIONS64 (MACH_SEND_INTERRUPT|MACH_RCV_INTERRUPT)
++#define MACH64_SEND_MQ_CALL 0x0000000400000000ull
++
++typedef mach_msg_return_t (*mach_msg2_trap_ptr_t)( void *data, uint64_t options,
++    uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port,
++    uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout );
++
++static mach_msg2_trap_ptr_t mach_msg2_trap;
++
++static inline mach_msg_return_t mach_msg2_internal( void *data, uint64_t option64, uint64_t msgh_bits_and_send_size,
++    uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout)
++{
++    mach_msg_return_t mr;
++
++    mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++             msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++             rcv_size_and_priority, timeout );
++
++    if (mr == MACH_MSG_SUCCESS)
++        return MACH_MSG_SUCCESS;
++
++    while (mr == MACH_SEND_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout );
++
++    while (mr == MACH_RCV_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size & 0xffffffffull,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout);
++
++    return mr;
++}
++
++/* For older versions of macOS we need to provide fallback in case there is no mach_msg2... */
++extern mach_msg_return_t mach_msg_trap( mach_msg_header_t *msg, mach_msg_option_t option,
+         mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_name_t rcv_name, mach_msg_timeout_t timeout,
+-        mach_msg_priority_t priority, mach_msg_header_t *rcv_msg, mach_msg_size_t rcv_limit);
++        mach_port_name_t notify );
++
++static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t option64,
++    mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_t rcv_name, uint64_t timeout,
++    uint32_t priority)
++{
++    mach_msg_base_t *base;
++    mach_msg_size_t descriptors;
++
++    if (!mach_msg2_trap)
++        return mach_msg_trap( data, (mach_msg_option_t)option64, send_size,
++                              rcv_size, rcv_name, timeout, priority );
++
++    base = (mach_msg_base_t *)data;
++
++    if ((option64 & MACH_SEND_MSG) &&
++        (base->header.msgh_bits & MACH_MSGH_BITS_COMPLEX))
++        descriptors = base->body.msgh_descriptor_count;
++    else
++        descriptors = 0;
++
++#define MACH_MSG2_SHIFT_ARGS(lo, hi) ((uint64_t)hi << 32 | (uint32_t)lo)
++    return mach_msg2_internal(data, option64 | MACH64_SEND_MQ_CALL,
++               MACH_MSG2_SHIFT_ARGS(data->msgh_bits, send_size),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_remote_port, data->msgh_local_port),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_voucher_port, data->msgh_id),
++               MACH_MSG2_SHIFT_ARGS(descriptors, rcv_name),
++               MACH_MSG2_SHIFT_ARGS(rcv_size, priority), timeout);
++#undef MACH_MSG2_SHIFT_ARGS
++}
+ 
+ static mach_port_name_t receive_port;
+ 
+@@ -218,8 +290,8 @@ static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
+     send_header.msgh_size = sizeof(send_header);
+     send_header.msgh_remote_port = receive_port;
+     
+-    return mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size,
+-                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
++                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
+ }
+ 
+ static inline mach_msg_return_t signal_all( unsigned int shm_idx )
+@@ -230,8 +302,8 @@ static inline mach_msg_return_t signal_all( unsigned int shm_idx )
+     send_header.msgh_size = sizeof(send_header);
+     send_header.msgh_remote_port = receive_port;
+     
+-    return mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size,
+-                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
++                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+ }
+ 
+ typedef struct
+@@ -252,8 +324,8 @@ typedef struct
+ 
+ static inline mach_msg_return_t receive_mach_msg( mach_register_message_t *buffer )
+ {
+-    return mach_msg_overwrite_trap( (mach_msg_header_t *)buffer, MACH_RCV_MSG, 0,
+-            sizeof(*buffer), receive_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    return mach_msg2( (mach_msg_header_t *)buffer, MACH_RCV_MSG, 0,
++            sizeof(*buffer), receive_port, MACH_MSG_TIMEOUT_NONE, 0 );
+ }
+ 
+ static void *get_shm( unsigned int idx );
+@@ -423,6 +495,7 @@ void msync_init(void)
+     struct stat st;
+     mach_port_t bootstrap_port;
+     mach_port_limits_t limits;
++    void *dlhandle = dlopen( NULL, RTLD_NOW );
+ 
+     if (fstat( config_dir_fd, &st ) == -1)
+         fatal_error( "cannot stat config dir\n" );
+@@ -452,7 +525,12 @@ void msync_init(void)
+     }
+     
+     /* Bootstrap mach server message pump */
+-    
++
++    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
++    if (!mach_msg2_trap)
++        fprintf( stderr, "msync: warning: using mach_msg_overwrite instead of mach_msg2\n");
++    dlclose( dlhandle );
++
+     MACH_CHECK_ERROR(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &receive_port), "mach_port_allocate");
+ 
+     MACH_CHECK_ERROR(mach_port_insert_right(mach_task_self(), receive_port, receive_port, MACH_MSG_TYPE_MAKE_SEND), "mach_port_insert_right");
+-- 
+2.39.2 (Apple Git-144)
+
