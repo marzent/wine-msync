@@ -4758,18 +4758,18 @@ index a99c60a28ff..43fe6b44f5e 100644
 2.39.2 (Apple Git-144)
 
 
-From d9afdf1983020bc25e12a8ac0f2898c774138113 Mon Sep 17 00:00:00 2001
+From d96bf52b5beacb4be4601ef8fa7e7f2f0f69e230 Mon Sep 17 00:00:00 2001
 From: Marc-Aurel Zent <marc_aurel@me.com>
-Date: Fri, 13 Oct 2023 18:27:59 +0200
+Date: Mon, 16 Oct 2023 08:09:31 +0200
 Subject: [PATCH] load mach_msg2 dynamically
 
 ---
- dlls/ntdll/unix/msync.c | 97 +++++++++++++++++++++++++++++++++++++----
- server/msync.c          | 96 ++++++++++++++++++++++++++++++++++++----
- 2 files changed, 175 insertions(+), 18 deletions(-)
+ dlls/ntdll/unix/msync.c | 95 +++++++++++++++++++++++++++++++++++++----
+ server/msync.c          | 94 ++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 173 insertions(+), 16 deletions(-)
 
 diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
-index b34d599f..861879ab 100644
+index 49e6825ad03..62e6f710f9b 100644
 --- a/dlls/ntdll/unix/msync.c
 +++ b/dlls/ntdll/unix/msync.c
 @@ -50,6 +50,7 @@
@@ -4871,7 +4871,7 @@ index b34d599f..861879ab 100644
 -                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
 +    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.prolog.header.msgh_size,
 +                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
-     
+ 
      if (mr != MACH_MSG_SUCCESS)
          ERR("Failed to send server register wait: %#x\n", mr);
 @@ -302,8 +374,8 @@ static inline void server_remove_wait( semaphore_t sem, unsigned int msgh_id,
@@ -4882,7 +4882,7 @@ index b34d599f..861879ab 100644
 -                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
 +    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
 +                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
-     
+ 
      if (mr != MACH_MSG_SUCCESS)
          ERR("Failed to send server remove wait: %#x\n", mr);
 @@ -651,6 +723,7 @@ void msync_init(void)
@@ -4901,12 +4901,10 @@ index b34d599f..861879ab 100644
          return;
      }
  
-@@ -694,7 +768,12 @@ void msync_init(void)
-     semaphore_pool_init();
-     
+@@ -695,6 +769,11 @@ void msync_init(void)
+ 
      /* Bootstrap mach wineserver communication */
--    
-+
+ 
 +    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
 +    if (!mach_msg2_trap)
 +        WARN("Using mach_msg_overwrite instead of mach_msg2\n");
@@ -4918,7 +4916,7 @@ index b34d599f..861879ab 100644
 @@ -734,8 +813,8 @@ static inline void signal_all( struct msync *obj )
      send_header.msgh_size = sizeof(send_header);
      send_header.msgh_remote_port = server_port;
-     
+ 
 -    mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
 -              MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
 +    mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
@@ -4927,7 +4925,7 @@ index b34d599f..861879ab 100644
  
  NTSTATUS msync_release_semaphore( HANDLE handle, ULONG count, ULONG *prev )
 diff --git a/server/msync.c b/server/msync.c
-index d673ce60..f066973f 100644
+index 02676eb1f58..4bff22f566d 100644
 --- a/server/msync.c
 +++ b/server/msync.c
 @@ -42,6 +42,7 @@
@@ -5024,7 +5022,7 @@ index d673ce60..f066973f 100644
 @@ -218,8 +290,8 @@ static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
      send_header.msgh_size = sizeof(send_header);
      send_header.msgh_remote_port = receive_port;
-     
+ 
 -    return mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size,
 -                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
 +    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
@@ -5035,7 +5033,7 @@ index d673ce60..f066973f 100644
 @@ -230,8 +302,8 @@ static inline mach_msg_return_t signal_all( unsigned int shm_idx )
      send_header.msgh_size = sizeof(send_header);
      send_header.msgh_remote_port = receive_port;
-     
+ 
 -    return mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size,
 -                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
 +    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
@@ -5062,12 +5060,10 @@ index d673ce60..f066973f 100644
  
      if (fstat( config_dir_fd, &st ) == -1)
          fatal_error( "cannot stat config dir\n" );
-@@ -452,7 +525,12 @@ void msync_init(void)
-     }
-     
+@@ -453,6 +526,11 @@ void msync_init(void)
+ 
      /* Bootstrap mach server message pump */
--    
-+
+ 
 +    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
 +    if (!mach_msg2_trap)
 +        fprintf( stderr, "msync: warning: using mach_msg_overwrite instead of mach_msg2\n");
