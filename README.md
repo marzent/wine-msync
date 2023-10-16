@@ -27,6 +27,32 @@ WINEMSYNC_QLIMIT=50
 WINEDEBUG="+msync"
 ```
 
+## How it works
+
+The problem with accelerating NT synchronization primitives is that it needs to be possible to wait on multiple of these, and they need to work cross-process.
+
+Originally, I intended to use `kqueue()`, since it supports multiplexing and seemed like a perfect fit, except that these kernel event queues are not inherited by a child created with fork, making them pretty useless for this...
+
+Incidentally, this is also the reason why solutions like [epoll-shim](https://github.com/jiixyj/epoll-shim) do not work for providing an efficient (cross-process) emulation of eventfds on non-Linux systems. Still, [libinotify-kqueue](https://github.com/libinotify-kqueue/libinotify-kqueue) works perfectly, for example.
+
+As an alternative, it is possible to do multiplexing with Mach port sets, but since every port can only have one receive right, this would mean that every process needs to create its own Mach port per object, and every other process (including wineserver) needs to be aware of all of these before they can signal an object.
+
+This is indirectly exactly what the current `esync` implementation on macOS does with its pipe file descriptors to work around the issue. A `write()` on an fd gets translated by the kernel to a Mach message send, and a `read()` to a Mach message receive (and Mach port management is handled under the hood).
+
+For msync, a slightly different approach was chosen, namely to mimic futex semantics with a separate thread managing wait (un-)registration and signaling. On first glance, this is counterintuitive, since the goal of `esync`/`fsync` was to avoid involving wineserver in wait operations at all. But this fits well into the microkernel origins from Mach, where additional functionality is provided in user-space.
+
+Performance is good here since `mach_msg()` is fast and happens asynchronously. For a contended wait, a process needs to do 2-3 system calls (only 2 most of the time), with the waiting and signaling being directly managed by the Mach semaphore subsystem (which is around 25% faster than swapping these out with message receive for waits and message sends for signaling).
+
+Mach semaphores have a higher creation overhead, though, which is why these are pooled client-side. Also, on the server side, several optimizations have been done to ensure that the Mach message pump runs as efficiently as possible.
+
+Of course, a kernel extension would provide even better performance here, but these are no longer recommended by Apple, and several hurdles have been put in place to load them starting with macOS 11.0.
+
+When a process initiates a wait with `msync`, it gets a semaphore from the semaphore pool, registers the objects now associated with this semaphore to wineserver, and starts waiting. If needed, it also unregisters it after waking again (non-successful wait or more than one wait object).
+
+A signal operation is a Mach message for wineserver, which will look up the object and signal and destroy each of the registered semaphores associated with that object.
+
+Races should effectively be not possible (at least I am trying to assure myself of that), since the registration and signaling happen on the same Mach port, and the message queue is supposed to be sequentially consistent across all processes. Additionally, before registration (and most likely after the client started its wait), the server rechecks the waiting condition, similar to futexes. Even if the client is preempted for a long time there and hasn't started its wait, the semaphore will be in a signaled state whenever it does.
+
 ## Bugs
 
 Please report any discovered bugs. A primary aim for ```msync``` was to enhance performance over simulated ```eventfd``` objects on macOS. If ```esync``` has better performance in any situation, that's considered a bug.
