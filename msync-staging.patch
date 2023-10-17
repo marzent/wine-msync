@@ -1,14 +1,14 @@
-From 4ff65ac3c1a1e8cba5657558874eefd48c5edded Mon Sep 17 00:00:00 2001
+From d771368b8654b4a8b533cd7f6517aedfe79f0f2a Mon Sep 17 00:00:00 2001
 From: Marc-Aurel Zent <marc_aurel@me.com>
-Date: Thu, 12 Oct 2023 20:02:53 +0200
+Date: Tue, 17 Oct 2023 21:20:58 +0200
 Subject: [PATCH] add msync
 
 ---
  dlls/ntdll/Makefile.in         |    1 +
  dlls/ntdll/unix/esync.c        |   15 +-
  dlls/ntdll/unix/loader.c       |    2 +
- dlls/ntdll/unix/msync.c        | 1492 ++++++++++++++++++++++++++++++++
- dlls/ntdll/unix/msync.h        |   50 ++
+ dlls/ntdll/unix/msync.c        | 1575 ++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/msync.h        |   50 +
  dlls/ntdll/unix/server.c       |    4 +
  dlls/ntdll/unix/sync.c         |   73 +-
  dlls/ntdll/unix/unix_private.h |    2 +
@@ -34,7 +34,7 @@ Subject: [PATCH] add msync
  server/mailslot.c              |    4 +
  server/main.c                  |    7 +
  server/mapping.c               |    3 +
- server/msync.c                 |  891 +++++++++++++++++++
+ server/msync.c                 |  976 ++++++++++++++++++++
  server/msync.h                 |   36 +
  server/mutex.c                 |    1 +
  server/named_pipe.c            |    5 +
@@ -42,7 +42,7 @@ Subject: [PATCH] add msync
  server/process.c               |   17 +
  server/process.h               |    1 +
  server/protocol.def            |   54 ++
- server/queue.c                 |   49 ++
+ server/queue.c                 |   49 +
  server/registry.c              |    1 +
  server/request.c               |    1 +
  server/request.h               |   38 +
@@ -51,14 +51,14 @@ Subject: [PATCH] add msync
  server/signal.c                |    1 +
  server/sock.c                  |    3 +
  server/symlink.c               |    1 +
- server/thread.c                |   37 +
+ server/thread.c                |   38 +
  server/thread.h                |    2 +
  server/timer.c                 |   19 +
  server/token.c                 |    1 +
  server/trace.c                 |   72 ++
  server/window.c                |    1 +
  server/winstation.c            |    2 +
- 54 files changed, 3135 insertions(+), 8 deletions(-)
+ 54 files changed, 3304 insertions(+), 8 deletions(-)
  create mode 100644 dlls/ntdll/unix/msync.c
  create mode 100644 dlls/ntdll/unix/msync.h
  create mode 100644 server/msync.c
@@ -157,10 +157,10 @@ index 60248f777e1..53ec80d940e 100644
      init_cpu_info();
 diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
 new file mode 100644
-index 00000000000..4378d2ee124
+index 00000000000..dd2eeee3960
 --- /dev/null
 +++ b/dlls/ntdll/unix/msync.c
-@@ -0,0 +1,1492 @@
+@@ -0,0 +1,1575 @@
 +/*
 + * mach semaphore-based synchronization objects
 + *
@@ -213,6 +213,7 @@ index 00000000000..4378d2ee124
 +# include <servers/bootstrap.h>
 +# include <os/lock.h>
 +#endif
++#include <dlfcn.h>
 +#include <sched.h>
 +#include <unistd.h>
 +
@@ -248,9 +249,80 @@ index 00000000000..4378d2ee124
 +    return ret;
 +}
 +
-+extern mach_msg_return_t mach_msg_overwrite_trap( mach_msg_header_t *msg, mach_msg_option_t option,
++/*
++ * Faster to directly do the syscall and inline everything, taken and slightly adapted
++ * from xnu/libsyscall/mach/mach_msg.c
++ */
++
++#define LIBMACH_OPTIONS64 (MACH_SEND_INTERRUPT|MACH_RCV_INTERRUPT)
++#define MACH64_SEND_MQ_CALL 0x0000000400000000ull
++
++typedef mach_msg_return_t (*mach_msg2_trap_ptr_t)( void *data, uint64_t options,
++    uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port,
++    uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout );
++
++static mach_msg2_trap_ptr_t mach_msg2_trap;
++
++static inline mach_msg_return_t mach_msg2_internal( void *data, uint64_t option64, uint64_t msgh_bits_and_send_size,
++    uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout)
++{
++    mach_msg_return_t mr;
++
++    mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++             msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++             rcv_size_and_priority, timeout );
++
++    if (mr == MACH_MSG_SUCCESS)
++        return MACH_MSG_SUCCESS;
++
++    while (mr == MACH_SEND_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout );
++
++    while (mr == MACH_RCV_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size & 0xffffffffull,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout);
++
++    return mr;
++}
++
++/* For older versions of macOS we need to provide fallback in case there is no mach_msg2... */
++extern mach_msg_return_t mach_msg_trap( mach_msg_header_t *msg, mach_msg_option_t option,
 +        mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_name_t rcv_name, mach_msg_timeout_t timeout,
-+        mach_msg_priority_t priority, mach_msg_header_t *rcv_msg, mach_msg_size_t rcv_limit);
++        mach_port_name_t notify );
++
++static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t option64,
++    mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_t rcv_name, uint64_t timeout,
++    uint32_t priority)
++{
++    mach_msg_base_t *base;
++    mach_msg_size_t descriptors;
++
++    if (!mach_msg2_trap)
++        return mach_msg_trap( data, (mach_msg_option_t)option64, send_size,
++                              rcv_size, rcv_name, timeout, priority );
++
++    base = (mach_msg_base_t *)data;
++
++    if ((option64 & MACH_SEND_MSG) &&
++        (base->header.msgh_bits & MACH_MSGH_BITS_COMPLEX))
++        descriptors = base->body.msgh_descriptor_count;
++    else
++        descriptors = 0;
++
++#define MACH_MSG2_SHIFT_ARGS(lo, hi) ((uint64_t)hi << 32 | (uint32_t)lo)
++    return mach_msg2_internal(data, option64 | MACH64_SEND_MQ_CALL,
++               MACH_MSG2_SHIFT_ARGS(data->msgh_bits, send_size),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_remote_port, data->msgh_local_port),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_voucher_port, data->msgh_id),
++               MACH_MSG2_SHIFT_ARGS(descriptors, rcv_name),
++               MACH_MSG2_SHIFT_ARGS(rcv_size, priority), timeout);
++#undef MACH_MSG2_SHIFT_ARGS
++}
 +
 +/* this is a lot, but running out cripples performance */
 +#define MAX_POOL_SEMAPHORES 1024
@@ -371,21 +443,20 @@ index 00000000000..4378d2ee124
 +    unsigned int shm_idx;
 +};
 +
-+static inline void resize_wait_objs( struct msync **wait_objs, int *count )
++static inline int resize_wait_objs( struct msync **wait_objs, struct msync **objs, int count )
 +{
-+    int read_index = 0;
-+    int write_index = 0;
++    int read_index, write_index = 0;
 +
-+    for (; read_index < *count; read_index++)
++    for (read_index = 0; read_index < count; read_index++)
 +    {
-+        if (wait_objs[read_index] != NULL)
++        if (wait_objs[read_index])
 +        {
-+            if (read_index != write_index)
-+                wait_objs[write_index] = wait_objs[read_index];
++            objs[write_index] = wait_objs[read_index];
 +            write_index++;
 +        }
 +    }
-+    *count = write_index;
++
++    return write_index;
 +}
 +
 +typedef struct
@@ -415,7 +486,7 @@ index 00000000000..4378d2ee124
 +static const mach_msg_bits_t msgh_bits_send = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
 +
 +static inline void server_register_wait( semaphore_t sem, unsigned int msgh_id,
-+                                        struct msync **wait_objs, const int count )
++                                         struct msync **wait_objs, const int count )
 +{
 +    int i, is_mutex;
 +    mach_msg_return_t mr;
@@ -440,15 +511,15 @@ index 00000000000..4378d2ee124
 +    message.prolog.header.msgh_size = sizeof(mach_register_message_prolog_t) +
 +                                      count * sizeof(unsigned int);
 +
-+    mr = mach_msg_overwrite_trap( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.prolog.header.msgh_size,
-+                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.prolog.header.msgh_size,
++                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 +
 +    if (mr != MACH_MSG_SUCCESS)
 +        ERR("Failed to send server register wait: %#x\n", mr);
 +}
 +
 +static inline void server_remove_wait( semaphore_t sem, unsigned int msgh_id,
-+                                        struct msync **wait_objs, const int count )
++                                       struct msync **wait_objs, const int count )
 +{
 +    int i;
 +    mach_msg_return_t mr;
@@ -464,54 +535,58 @@ index 00000000000..4378d2ee124
 +    message.header.msgh_size = sizeof(mach_msg_header_t) +
 +                               count * sizeof(unsigned int);
 +
-+    mr = mach_msg_overwrite_trap( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
-+                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
++                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 +
 +    if (mr != MACH_MSG_SUCCESS)
 +        ERR("Failed to send server remove wait: %#x\n", mr);
 +}
 +
-+static NTSTATUS msync_wait_multiple( struct msync **wait_objs,
-+                                     int count, ULONGLONG *end )
++static inline int check_shm_contention( struct msync **wait_objs,
++                                        int count, int tid )
 +{
-+    int i, val, tid;
-+    semaphore_t *sem;
-+    kern_return_t kr;
-+    LONGLONG timeleft;
-+    unsigned int msgh_id;
++    int i, val;
 +
-+    resize_wait_objs( wait_objs, &count );
-+
-+    tid = GetCurrentThreadId();
 +    for (i = 0; i < count; i++)
 +    {
 +        val = __atomic_load_n((int *)wait_objs[i]->shm, __ATOMIC_SEQ_CST);
 +        if (wait_objs[i]->type == MSYNC_MUTEX)
 +        {
-+            if (val == 0 || val == ~0 || val == tid) return STATUS_PENDING;
++            if (val == 0 || val == ~0 || val == tid) return 1;
 +        }
 +        else
 +        {
-+            if (val != 0)  return STATUS_PENDING;
++            if (val != 0)  return 1;
 +        }
 +    }
++    return 0;
++}
++
++static NTSTATUS msync_wait_multiple( struct msync **wait_objs,
++                                     int count, ULONGLONG *end )
++{
++    int tid;
++    semaphore_t *sem;
++    kern_return_t kr;
++    unsigned int msgh_id;
++    __thread static struct msync *objs[MAXIMUM_WAIT_OBJECTS + 1];
++
++    count = resize_wait_objs( wait_objs, objs, count );
++
++    tid = GetCurrentThreadId();
++
++    if (check_shm_contention( objs, count, tid ))
++        return STATUS_PENDING;
 +
 +    sem = semaphore_pool_alloc();
 +    msgh_id = (tid << 8) | count;
-+    server_register_wait( *sem, msgh_id, wait_objs, count );
++    server_register_wait( *sem, msgh_id, objs, count );
 +
 +    do
 +    {
 +        if (end)
-+        {
-+            timeleft = update_timeout( *end );
-+            if (!timeleft)
-+            {
-+                kr = KERN_OPERATION_TIMED_OUT;
-+                break;
-+            }
-+            kr = semaphore_timedwait( *sem, convert_to_mach_time( timeleft ) );
-+        }
++            kr = semaphore_timedwait( *sem,
++                        convert_to_mach_time( update_timeout( *end ) ) );
 +        else
 +            kr = semaphore_wait( *sem );
 +    } while (kr == KERN_ABORTED);
@@ -521,24 +596,25 @@ index 00000000000..4378d2ee124
 +    switch (kr) {
 +        case KERN_SUCCESS:
 +            if (count > 1)
-+                server_remove_wait( *sem, msgh_id, wait_objs, count );
++                server_remove_wait( *sem, msgh_id, objs, count );
 +            return STATUS_SUCCESS;
 +        case KERN_OPERATION_TIMED_OUT:
-+            server_remove_wait( *sem, msgh_id, wait_objs, count );
++            server_remove_wait( *sem, msgh_id, objs, count );
++            if (check_shm_contention( objs, count, tid ))
++                return STATUS_PENDING;
 +            return STATUS_TIMEOUT;
 +        case KERN_TERMINATED:
-+            server_remove_wait( *sem, msgh_id, wait_objs, count );
++            server_remove_wait( *sem, msgh_id, objs, count );
 +            if (end)
 +            {
-+                timeleft = update_timeout( *end );
-+                usleep(timeleft / 10);
++                usleep( update_timeout( *end ) / 10 );
 +                return STATUS_TIMEOUT;
 +            }
 +            pause();
 +            return STATUS_PENDING;
 +        default:
-+            server_remove_wait( *sem, msgh_id, wait_objs, count );
-+            ERR("Unexpected kernel return code: %#x %s\n", kr, mach_error_string(kr));
++            server_remove_wait( *sem, msgh_id, objs, count );
++            ERR("Unexpected kernel return code: %#x %s\n", kr, mach_error_string( kr ));
 +            return STATUS_PENDING;
 +    }
 +}
@@ -813,6 +889,7 @@ index 00000000000..4378d2ee124
 +{
 +    struct stat st;
 +    mach_port_t bootstrap_port;
++    void *dlhandle = dlopen( NULL, RTLD_NOW );
 +
 +    if (!do_msync())
 +    {
@@ -827,6 +904,7 @@ index 00000000000..4378d2ee124
 +            exit(1);
 +        }
 +
++        dlclose( dlhandle );
 +        return;
 +    }
 +
@@ -856,6 +934,11 @@ index 00000000000..4378d2ee124
 +    semaphore_pool_init();
 +
 +    /* Bootstrap mach wineserver communication */
++
++    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
++    if (!mach_msg2_trap)
++        WARN("Using mach_msg_overwrite instead of mach_msg2\n");
++    dlclose( dlhandle );
 +
 +    if (task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bootstrap_port) != KERN_SUCCESS)
 +    {
@@ -896,8 +979,8 @@ index 00000000000..4378d2ee124
 +    send_header.msgh_size = sizeof(send_header);
 +    send_header.msgh_remote_port = server_port;
 +
-+    mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
-+              MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
++              MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 +}
 +
 +NTSTATUS msync_release_semaphore( HANDLE handle, ULONG count, ULONG *prev )
@@ -1155,7 +1238,7 @@ index 00000000000..4378d2ee124
 +{
 +    static const LARGE_INTEGER zero = {0};
 +
-+    struct msync *objs[MAXIMUM_WAIT_OBJECTS + 1];
++    __thread static struct msync *objs[MAXIMUM_WAIT_OBJECTS + 1];
 +    struct msync apc_obj;
 +    int has_msync = 0, has_server = 0;
 +    BOOL msgwait = FALSE;
@@ -2909,10 +2992,10 @@ index 1acfb032bfd..de9ea8a197f 100644
      mapping_get_fd,              /* get_fd */
 diff --git a/server/msync.c b/server/msync.c
 new file mode 100644
-index 00000000000..02676eb1f58
+index 00000000000..bd5d5203e3a
 --- /dev/null
 +++ b/server/msync.c
-@@ -0,0 +1,891 @@
+@@ -0,0 +1,976 @@
 +/*
 + * mach semaphore-based synchronization objects
 + *
@@ -2957,6 +3040,7 @@ index 00000000000..02676eb1f58
 +# include <servers/bootstrap.h>
 +#endif
 +#include <sched.h>
++#include <dlfcn.h>
 +#include <signal.h>
 +#include <pthread.h>
 +#include <unistd.h>
@@ -2986,9 +3070,80 @@ index 00000000000..02676eb1f58
 +/* Private API to register a mach port with the bootstrap server */
 +extern kern_return_t bootstrap_register2( mach_port_t bp, name_t service_name, mach_port_t sp, int flags );
 +
-+extern mach_msg_return_t mach_msg_overwrite_trap( mach_msg_header_t *msg, mach_msg_option_t option,
++/*
++ * Faster to directly do the syscall and inline everything, taken and slightly adapted
++ * from xnu/libsyscall/mach/mach_msg.c
++ */
++
++#define LIBMACH_OPTIONS64 (MACH_SEND_INTERRUPT|MACH_RCV_INTERRUPT)
++#define MACH64_SEND_MQ_CALL 0x0000000400000000ull
++
++typedef mach_msg_return_t (*mach_msg2_trap_ptr_t)( void *data, uint64_t options,
++    uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port,
++    uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout );
++
++static mach_msg2_trap_ptr_t mach_msg2_trap;
++
++static inline mach_msg_return_t mach_msg2_internal( void *data, uint64_t option64, uint64_t msgh_bits_and_send_size,
++    uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout)
++{
++    mach_msg_return_t mr;
++
++    mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++             msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++             rcv_size_and_priority, timeout );
++
++    if (mr == MACH_MSG_SUCCESS)
++        return MACH_MSG_SUCCESS;
++
++    while (mr == MACH_SEND_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout );
++
++    while (mr == MACH_RCV_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size & 0xffffffffull,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout);
++
++    return mr;
++}
++
++/* For older versions of macOS we need to provide fallback in case there is no mach_msg2... */
++extern mach_msg_return_t mach_msg_trap( mach_msg_header_t *msg, mach_msg_option_t option,
 +        mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_name_t rcv_name, mach_msg_timeout_t timeout,
-+        mach_msg_priority_t priority, mach_msg_header_t *rcv_msg, mach_msg_size_t rcv_limit);
++        mach_port_name_t notify );
++
++static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t option64,
++    mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_t rcv_name, uint64_t timeout,
++    uint32_t priority)
++{
++    mach_msg_base_t *base;
++    mach_msg_size_t descriptors;
++
++    if (!mach_msg2_trap)
++        return mach_msg_trap( data, (mach_msg_option_t)option64, send_size,
++                              rcv_size, rcv_name, timeout, priority );
++
++    base = (mach_msg_base_t *)data;
++
++    if ((option64 & MACH_SEND_MSG) &&
++        (base->header.msgh_bits & MACH_MSGH_BITS_COMPLEX))
++        descriptors = base->body.msgh_descriptor_count;
++    else
++        descriptors = 0;
++
++#define MACH_MSG2_SHIFT_ARGS(lo, hi) ((uint64_t)hi << 32 | (uint32_t)lo)
++    return mach_msg2_internal(data, option64 | MACH64_SEND_MQ_CALL,
++               MACH_MSG2_SHIFT_ARGS(data->msgh_bits, send_size),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_remote_port, data->msgh_local_port),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_voucher_port, data->msgh_id),
++               MACH_MSG2_SHIFT_ARGS(descriptors, rcv_name),
++               MACH_MSG2_SHIFT_ARGS(rcv_size, priority), timeout);
++#undef MACH_MSG2_SHIFT_ARGS
++}
 +
 +static mach_port_name_t receive_port;
 +
@@ -3045,15 +3200,22 @@ index 00000000000..02676eb1f58
 +struct sem_list
 +{
 +    struct sem_node *head;
-+    int is_used;
 +};
 +
 +static struct sem_list mach_semaphore_map[MAX_INDEX];
++
++static char is_index_used[MAX_INDEX];
 +
 +static inline void add_sem( unsigned int shm_idx, semaphore_t sem, int tid )
 +{
 +    struct sem_node *new_node;
 +    struct sem_list *list = mach_semaphore_map + shm_idx;
++
++    if (!__atomic_load_n(&is_index_used[shm_idx], __ATOMIC_SEQ_CST))
++    {
++        fprintf( stderr, "msync: warning: trying to add semaphore to unused index\n" );
++        return;
++    }
 +
 +    new_node = pool_alloc();
 +    new_node->sem = sem;
@@ -3092,7 +3254,7 @@ index 00000000000..02676eb1f58
 +
 +    current = list->head;
 +    list->head = NULL;
-+    __atomic_store_n( &list->is_used, 0, __ATOMIC_SEQ_CST );
++    __atomic_store_n( &is_index_used[shm_idx], 0, __ATOMIC_SEQ_CST );
 +
 +    while (current)
 +    {
@@ -3133,8 +3295,8 @@ index 00000000000..02676eb1f58
 +    send_header.msgh_size = sizeof(send_header);
 +    send_header.msgh_remote_port = receive_port;
 +
-+    return mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size,
-+                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
++                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
 +}
 +
 +static inline mach_msg_return_t signal_all( unsigned int shm_idx )
@@ -3145,8 +3307,8 @@ index 00000000000..02676eb1f58
 +    send_header.msgh_size = sizeof(send_header);
 +    send_header.msgh_remote_port = receive_port;
 +
-+    return mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size,
-+                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
++                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 +}
 +
 +typedef struct
@@ -3167,8 +3329,8 @@ index 00000000000..02676eb1f58
 +
 +static inline mach_msg_return_t receive_mach_msg( mach_register_message_t *buffer )
 +{
-+    return mach_msg_overwrite_trap( (mach_msg_header_t *)buffer, MACH_RCV_MSG, 0,
-+            sizeof(*buffer), receive_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
++    return mach_msg2( (mach_msg_header_t *)buffer, MACH_RCV_MSG, 0,
++            sizeof(*buffer), receive_port, MACH_MSG_TIMEOUT_NONE, 0 );
 +}
 +
 +static void *get_shm( unsigned int idx );
@@ -3338,6 +3500,7 @@ index 00000000000..02676eb1f58
 +    struct stat st;
 +    mach_port_t bootstrap_port;
 +    mach_port_limits_t limits;
++    void *dlhandle = dlopen( NULL, RTLD_NOW );
 +
 +    if (fstat( config_dir_fd, &st ) == -1)
 +        fatal_error( "cannot stat config dir\n" );
@@ -3356,7 +3519,7 @@ index 00000000000..02676eb1f58
 +
 +    pagesize = sysconf( _SC_PAGESIZE );
 +
-+    mach_semaphore_map[0].is_used = 1;
++    is_index_used[0] = 1;
 +    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
 +    shm_addrs_size = 128;
 +
@@ -3367,6 +3530,11 @@ index 00000000000..02676eb1f58
 +    }
 +
 +    /* Bootstrap mach server message pump */
++
++    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
++    if (!mach_msg2_trap)
++        fprintf( stderr, "msync: warning: using mach_msg_overwrite instead of mach_msg2\n");
++    dlclose( dlhandle );
 +
 +    MACH_CHECK_ERROR(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &receive_port), "mach_port_allocate");
 +
@@ -3530,7 +3698,7 @@ index 00000000000..02676eb1f58
 +
 +    shm_idx = shm_idx_counter;
 +
-+    while (__atomic_load_n( &mach_semaphore_map[shm_idx].is_used, __ATOMIC_SEQ_CST ))
++    while (__atomic_load_n( &is_index_used[shm_idx], __ATOMIC_SEQ_CST ))
 +    {
 +        shm_idx = (shm_idx + 1) % MAX_INDEX;
 +        if (tries++ > MAX_INDEX)
@@ -3541,7 +3709,7 @@ index 00000000000..02676eb1f58
 +            fatal_error("too many msync objects\n");
 +        }
 +    }
-+    __atomic_store_n( &mach_semaphore_map[shm_idx].is_used, 1, __ATOMIC_SEQ_CST );
++    __atomic_store_n( &is_index_used[shm_idx], 1, __ATOMIC_SEQ_CST );
 +    assert(mach_semaphore_map[shm_idx].head == NULL);
 +    shm_idx_counter = (shm_idx + 1) % MAX_INDEX;
 +
@@ -4392,7 +4560,7 @@ index 8cb24b4ff6e..abcc4c750e5 100644
      no_signal,                    /* signal */
      no_get_fd,                    /* get_fd */
 diff --git a/server/thread.c b/server/thread.c
-index ed364ecdee4..114dec70652 100644
+index ed364ecdee4..294cc16d96e 100644
 --- a/server/thread.c
 +++ b/server/thread.c
 @@ -51,6 +51,7 @@
@@ -4435,15 +4603,16 @@ index ed364ecdee4..114dec70652 100644
      no_satisfied,               /* satisfied */
      no_signal,                  /* signal */
      no_get_fd,                  /* get_fd */
-@@ -233,6 +238,7 @@ static inline void init_thread_structure( struct thread *thread )
+@@ -233,6 +238,8 @@ static inline void init_thread_structure( struct thread *thread )
      thread->entry_point     = 0;
      thread->esync_fd        = -1;
      thread->esync_apc_fd    = -1;
 +    thread->msync_idx       = 0;
++    thread->msync_apc_idx   = 0;
      thread->system_regs     = 0;
      thread->queue           = NULL;
      thread->wait            = NULL;
-@@ -380,6 +386,12 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
+@@ -380,6 +387,12 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
          }
      }
  
@@ -4456,7 +4625,7 @@ index ed364ecdee4..114dec70652 100644
      if (do_esync())
      {
          thread->esync_fd = esync_create_fd( 0, 0 );
-@@ -468,6 +480,12 @@ static void destroy_thread( struct object *obj )
+@@ -468,6 +481,12 @@ static void destroy_thread( struct object *obj )
  
      if (do_esync())
          close( thread->esync_fd );
@@ -4469,7 +4638,7 @@ index ed364ecdee4..114dec70652 100644
  }
  
  /* dump a thread on stdout for debugging purposes */
-@@ -493,6 +511,13 @@ static int thread_get_esync_fd( struct object *obj, enum esync_type *type )
+@@ -493,6 +512,13 @@ static int thread_get_esync_fd( struct object *obj, enum esync_type *type )
      return thread->esync_fd;
  }
  
@@ -4483,7 +4652,7 @@ index ed364ecdee4..114dec70652 100644
  static unsigned int thread_map_access( struct object *obj, unsigned int access )
  {
      access = default_map_access( obj, access );
-@@ -545,6 +570,7 @@ static struct thread_apc *create_apc( struct object *owner, const apc_call_t *ca
+@@ -545,6 +571,7 @@ static struct thread_apc *create_apc( struct object *owner, const apc_call_t *ca
          apc->result.type = APC_NONE;
          if (owner) grab_object( owner );
      }
@@ -4491,7 +4660,7 @@ index ed364ecdee4..114dec70652 100644
      return apc;
  }
  
-@@ -1087,6 +1113,9 @@ void wake_up( struct object *obj, int max )
+@@ -1087,6 +1114,9 @@ void wake_up( struct object *obj, int max )
      struct list *ptr;
      int ret;
  
@@ -4501,7 +4670,7 @@ index ed364ecdee4..114dec70652 100644
      if (do_esync())
          esync_wake_up( obj );
  
-@@ -1177,6 +1206,9 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
+@@ -1177,6 +1207,9 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
      {
          wake_thread( thread );
  
@@ -4511,17 +4680,17 @@ index ed364ecdee4..114dec70652 100644
          if (do_esync() && queue == &thread->user_apc)
              esync_wake_fd( thread->esync_apc_fd );
      }
-@@ -1227,6 +1259,9 @@ static struct thread_apc *thread_dequeue_apc( struct thread *thread, int system
+@@ -1227,6 +1260,9 @@ static struct thread_apc *thread_dequeue_apc( struct thread *thread, int system
          list_remove( ptr );
      }
  
 +    if (do_msync() && list_empty( &thread->system_apc ) && list_empty( &thread->user_apc ))
-+        msync_clear( &thread->obj );
++        msync_clear_shm( thread->msync_apc_idx );
 +
      if (do_esync() && list_empty( &thread->system_apc ) && list_empty( &thread->user_apc ))
          esync_clear( thread->esync_apc_fd );
  
-@@ -1345,6 +1380,8 @@ void kill_thread( struct thread *thread, int violent_death )
+@@ -1345,6 +1381,8 @@ void kill_thread( struct thread *thread, int violent_death )
      }
      kill_console_processes( thread, 0 );
      abandon_mutexes( thread );
@@ -4768,615 +4937,6 @@ index 7692fbe3ed2..2ffbb510862 100644
      NULL,                         /* satisfied */
      no_signal,                    /* signal */
      no_get_fd,                    /* get_fd */
--- 
-2.39.2 (Apple Git-144)
-
-
-From 5badda2f58ce5e6dc08f6d521169922850f826af Mon Sep 17 00:00:00 2001
-From: Marc-Aurel Zent <marc_aurel@me.com>
-Date: Mon, 16 Oct 2023 08:02:54 +0200
-Subject: [PATCH] load mach_msg2 dynamically
-
----
- dlls/ntdll/unix/msync.c | 95 +++++++++++++++++++++++++++++++++++++----
- server/msync.c          | 94 ++++++++++++++++++++++++++++++++++++----
- 2 files changed, 173 insertions(+), 16 deletions(-)
-
-diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
-index 4378d2ee124..1bc967ecf27 100644
---- a/dlls/ntdll/unix/msync.c
-+++ b/dlls/ntdll/unix/msync.c
-@@ -50,6 +50,7 @@
- # include <servers/bootstrap.h>
- # include <os/lock.h>
- #endif
-+#include <dlfcn.h>
- #include <sched.h>
- #include <unistd.h>
- 
-@@ -85,9 +86,80 @@ static inline mach_timespec_t convert_to_mach_time( LONGLONG win32_time )
-     return ret;
- }
- 
--extern mach_msg_return_t mach_msg_overwrite_trap( mach_msg_header_t *msg, mach_msg_option_t option,
-+/*
-+ * Faster to directly do the syscall and inline everything, taken and slightly adapted
-+ * from xnu/libsyscall/mach/mach_msg.c
-+ */
-+
-+#define LIBMACH_OPTIONS64 (MACH_SEND_INTERRUPT|MACH_RCV_INTERRUPT)
-+#define MACH64_SEND_MQ_CALL 0x0000000400000000ull
-+
-+typedef mach_msg_return_t (*mach_msg2_trap_ptr_t)( void *data, uint64_t options,
-+    uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port,
-+    uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
-+    uint64_t rcv_size_and_priority, uint64_t timeout );
-+
-+static mach_msg2_trap_ptr_t mach_msg2_trap;
-+
-+static inline mach_msg_return_t mach_msg2_internal( void *data, uint64_t option64, uint64_t msgh_bits_and_send_size,
-+    uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
-+    uint64_t rcv_size_and_priority, uint64_t timeout)
-+{
-+    mach_msg_return_t mr;
-+
-+    mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
-+             msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
-+             rcv_size_and_priority, timeout );
-+
-+    if (mr == MACH_MSG_SUCCESS)
-+        return MACH_MSG_SUCCESS;
-+
-+    while (mr == MACH_SEND_INTERRUPTED)
-+        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
-+                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
-+                 rcv_size_and_priority, timeout );
-+
-+    while (mr == MACH_RCV_INTERRUPTED)
-+        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size & 0xffffffffull,
-+                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
-+                 rcv_size_and_priority, timeout);
-+
-+    return mr;
-+}
-+
-+/* For older versions of macOS we need to provide fallback in case there is no mach_msg2... */
-+extern mach_msg_return_t mach_msg_trap( mach_msg_header_t *msg, mach_msg_option_t option,
-         mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_name_t rcv_name, mach_msg_timeout_t timeout,
--        mach_msg_priority_t priority, mach_msg_header_t *rcv_msg, mach_msg_size_t rcv_limit);
-+        mach_port_name_t notify );
-+
-+static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t option64,
-+    mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_t rcv_name, uint64_t timeout,
-+    uint32_t priority)
-+{
-+    mach_msg_base_t *base;
-+    mach_msg_size_t descriptors;
-+
-+    if (!mach_msg2_trap)
-+        return mach_msg_trap( data, (mach_msg_option_t)option64, send_size,
-+                              rcv_size, rcv_name, timeout, priority );
-+
-+    base = (mach_msg_base_t *)data;
-+
-+    if ((option64 & MACH_SEND_MSG) &&
-+        (base->header.msgh_bits & MACH_MSGH_BITS_COMPLEX))
-+        descriptors = base->body.msgh_descriptor_count;
-+    else
-+        descriptors = 0;
-+
-+#define MACH_MSG2_SHIFT_ARGS(lo, hi) ((uint64_t)hi << 32 | (uint32_t)lo)
-+    return mach_msg2_internal(data, option64 | MACH64_SEND_MQ_CALL,
-+               MACH_MSG2_SHIFT_ARGS(data->msgh_bits, send_size),
-+               MACH_MSG2_SHIFT_ARGS(data->msgh_remote_port, data->msgh_local_port),
-+               MACH_MSG2_SHIFT_ARGS(data->msgh_voucher_port, data->msgh_id),
-+               MACH_MSG2_SHIFT_ARGS(descriptors, rcv_name),
-+               MACH_MSG2_SHIFT_ARGS(rcv_size, priority), timeout);
-+#undef MACH_MSG2_SHIFT_ARGS
-+}
- 
- /* this is a lot, but running out cripples performance */
- #define MAX_POOL_SEMAPHORES 1024
-@@ -277,8 +349,8 @@ static inline void server_register_wait( semaphore_t sem, unsigned int msgh_id,
-     message.prolog.header.msgh_size = sizeof(mach_register_message_prolog_t) +
-                                       count * sizeof(unsigned int);
- 
--    mr = mach_msg_overwrite_trap( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.prolog.header.msgh_size,
--                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
-+    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.prolog.header.msgh_size,
-+                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
- 
-     if (mr != MACH_MSG_SUCCESS)
-         ERR("Failed to send server register wait: %#x\n", mr);
-@@ -301,8 +373,8 @@ static inline void server_remove_wait( semaphore_t sem, unsigned int msgh_id,
-     message.header.msgh_size = sizeof(mach_msg_header_t) +
-                                count * sizeof(unsigned int);
- 
--    mr = mach_msg_overwrite_trap( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
--                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
-+    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
-+                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
- 
-     if (mr != MACH_MSG_SUCCESS)
-         ERR("Failed to send server remove wait: %#x\n", mr);
-@@ -650,6 +722,7 @@ void msync_init(void)
- {
-     struct stat st;
-     mach_port_t bootstrap_port;
-+    void *dlhandle = dlopen( NULL, RTLD_NOW );
- 
-     if (!do_msync())
-     {
-@@ -664,6 +737,7 @@ void msync_init(void)
-             exit(1);
-         }
- 
-+        dlclose( dlhandle );
-         return;
-     }
- 
-@@ -694,6 +768,11 @@ void msync_init(void)
- 
-     /* Bootstrap mach wineserver communication */
- 
-+    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
-+    if (!mach_msg2_trap)
-+        WARN("Using mach_msg_overwrite instead of mach_msg2\n");
-+    dlclose( dlhandle );
-+
-     if (task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bootstrap_port) != KERN_SUCCESS)
-     {
-         ERR("Failed task_get_special_port\n");
-@@ -733,8 +812,8 @@ static inline void signal_all( struct msync *obj )
-     send_header.msgh_size = sizeof(send_header);
-     send_header.msgh_remote_port = server_port;
- 
--    mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
--              MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
-+    mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
-+              MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
- }
- 
- NTSTATUS msync_release_semaphore( HANDLE handle, ULONG count, ULONG *prev )
-diff --git a/server/msync.c b/server/msync.c
-index 02676eb1f58..4bff22f566d 100644
---- a/server/msync.c
-+++ b/server/msync.c
-@@ -42,6 +42,7 @@
- # include <servers/bootstrap.h>
- #endif
- #include <sched.h>
-+#include <dlfcn.h>
- #include <signal.h>
- #include <pthread.h>
- #include <unistd.h>
-@@ -71,9 +72,80 @@
- /* Private API to register a mach port with the bootstrap server */
- extern kern_return_t bootstrap_register2( mach_port_t bp, name_t service_name, mach_port_t sp, int flags );
- 
--extern mach_msg_return_t mach_msg_overwrite_trap( mach_msg_header_t *msg, mach_msg_option_t option,
-+/*
-+ * Faster to directly do the syscall and inline everything, taken and slightly adapted
-+ * from xnu/libsyscall/mach/mach_msg.c
-+ */
-+
-+#define LIBMACH_OPTIONS64 (MACH_SEND_INTERRUPT|MACH_RCV_INTERRUPT)
-+#define MACH64_SEND_MQ_CALL 0x0000000400000000ull
-+
-+typedef mach_msg_return_t (*mach_msg2_trap_ptr_t)( void *data, uint64_t options,
-+    uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port,
-+    uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
-+    uint64_t rcv_size_and_priority, uint64_t timeout );
-+
-+static mach_msg2_trap_ptr_t mach_msg2_trap;
-+
-+static inline mach_msg_return_t mach_msg2_internal( void *data, uint64_t option64, uint64_t msgh_bits_and_send_size,
-+    uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
-+    uint64_t rcv_size_and_priority, uint64_t timeout)
-+{
-+    mach_msg_return_t mr;
-+
-+    mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
-+             msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
-+             rcv_size_and_priority, timeout );
-+
-+    if (mr == MACH_MSG_SUCCESS)
-+        return MACH_MSG_SUCCESS;
-+
-+    while (mr == MACH_SEND_INTERRUPTED)
-+        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
-+                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
-+                 rcv_size_and_priority, timeout );
-+
-+    while (mr == MACH_RCV_INTERRUPTED)
-+        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size & 0xffffffffull,
-+                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
-+                 rcv_size_and_priority, timeout);
-+
-+    return mr;
-+}
-+
-+/* For older versions of macOS we need to provide fallback in case there is no mach_msg2... */
-+extern mach_msg_return_t mach_msg_trap( mach_msg_header_t *msg, mach_msg_option_t option,
-         mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_name_t rcv_name, mach_msg_timeout_t timeout,
--        mach_msg_priority_t priority, mach_msg_header_t *rcv_msg, mach_msg_size_t rcv_limit);
-+        mach_port_name_t notify );
-+
-+static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t option64,
-+    mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_t rcv_name, uint64_t timeout,
-+    uint32_t priority)
-+{
-+    mach_msg_base_t *base;
-+    mach_msg_size_t descriptors;
-+
-+    if (!mach_msg2_trap)
-+        return mach_msg_trap( data, (mach_msg_option_t)option64, send_size,
-+                              rcv_size, rcv_name, timeout, priority );
-+
-+    base = (mach_msg_base_t *)data;
-+
-+    if ((option64 & MACH_SEND_MSG) &&
-+        (base->header.msgh_bits & MACH_MSGH_BITS_COMPLEX))
-+        descriptors = base->body.msgh_descriptor_count;
-+    else
-+        descriptors = 0;
-+
-+#define MACH_MSG2_SHIFT_ARGS(lo, hi) ((uint64_t)hi << 32 | (uint32_t)lo)
-+    return mach_msg2_internal(data, option64 | MACH64_SEND_MQ_CALL,
-+               MACH_MSG2_SHIFT_ARGS(data->msgh_bits, send_size),
-+               MACH_MSG2_SHIFT_ARGS(data->msgh_remote_port, data->msgh_local_port),
-+               MACH_MSG2_SHIFT_ARGS(data->msgh_voucher_port, data->msgh_id),
-+               MACH_MSG2_SHIFT_ARGS(descriptors, rcv_name),
-+               MACH_MSG2_SHIFT_ARGS(rcv_size, priority), timeout);
-+#undef MACH_MSG2_SHIFT_ARGS
-+}
- 
- static mach_port_name_t receive_port;
- 
-@@ -218,8 +290,8 @@ static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
-     send_header.msgh_size = sizeof(send_header);
-     send_header.msgh_remote_port = receive_port;
- 
--    return mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size,
--                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
-+    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
-+                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
- }
- 
- static inline mach_msg_return_t signal_all( unsigned int shm_idx )
-@@ -230,8 +302,8 @@ static inline mach_msg_return_t signal_all( unsigned int shm_idx )
-     send_header.msgh_size = sizeof(send_header);
-     send_header.msgh_remote_port = receive_port;
- 
--    return mach_msg_overwrite_trap( &send_header, MACH_SEND_MSG, send_header.msgh_size,
--                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
-+    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
-+                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
- }
- 
- typedef struct
-@@ -252,8 +324,8 @@ typedef struct
- 
- static inline mach_msg_return_t receive_mach_msg( mach_register_message_t *buffer )
- {
--    return mach_msg_overwrite_trap( (mach_msg_header_t *)buffer, MACH_RCV_MSG, 0,
--            sizeof(*buffer), receive_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, NULL, 0 );
-+    return mach_msg2( (mach_msg_header_t *)buffer, MACH_RCV_MSG, 0,
-+            sizeof(*buffer), receive_port, MACH_MSG_TIMEOUT_NONE, 0 );
- }
- 
- static void *get_shm( unsigned int idx );
-@@ -423,6 +495,7 @@ void msync_init(void)
-     struct stat st;
-     mach_port_t bootstrap_port;
-     mach_port_limits_t limits;
-+    void *dlhandle = dlopen( NULL, RTLD_NOW );
- 
-     if (fstat( config_dir_fd, &st ) == -1)
-         fatal_error( "cannot stat config dir\n" );
-@@ -453,6 +526,11 @@ void msync_init(void)
- 
-     /* Bootstrap mach server message pump */
- 
-+    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
-+    if (!mach_msg2_trap)
-+        fprintf( stderr, "msync: warning: using mach_msg_overwrite instead of mach_msg2\n");
-+    dlclose( dlhandle );
-+
-     MACH_CHECK_ERROR(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &receive_port), "mach_port_allocate");
- 
-     MACH_CHECK_ERROR(mach_port_insert_right(mach_task_self(), receive_port, receive_port, MACH_MSG_TYPE_MAKE_SEND), "mach_port_insert_right");
--- 
-2.39.2 (Apple Git-144)
-
-
-From 588229ef56f0b9099bc004dd2facf8fe731475a0 Mon Sep 17 00:00:00 2001
-From: Marc-Aurel Zent <marc_aurel@me.com>
-Date: Mon, 16 Oct 2023 11:59:06 +0200
-Subject: [PATCH 1/2] double check contention on timeout
-
----
- dlls/ntdll/unix/msync.c | 84 +++++++++++++++++++++--------------------
- 1 file changed, 44 insertions(+), 40 deletions(-)
-
-diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
-index 62e6f710f9b..26ad88f4b04 100644
---- a/dlls/ntdll/unix/msync.c
-+++ b/dlls/ntdll/unix/msync.c
-@@ -281,21 +281,20 @@ struct msync
-     unsigned int shm_idx;
- };
- 
--static inline void resize_wait_objs( struct msync **wait_objs, int *count )
-+static inline int resize_wait_objs( struct msync **wait_objs, struct msync **objs, int count )
- {
--    int read_index = 0;
--    int write_index = 0;
-+    int read_index, write_index = 0;
- 
--    for (; read_index < *count; read_index++)
-+    for (read_index = 0; read_index < count; read_index++)
-     {
--        if (wait_objs[read_index] != NULL)
-+        if (wait_objs[read_index])
-         {
--            if (read_index != write_index)
--                wait_objs[write_index] = wait_objs[read_index];
-+            objs[write_index] = wait_objs[read_index];
-             write_index++;
-         }
-     }
--    *count = write_index;
-+
-+    return write_index;
- }
- 
- typedef struct
-@@ -325,7 +324,7 @@ static const mach_msg_bits_t msgh_bits_complex_send = MACH_MSGH_BITS_SET(
- static const mach_msg_bits_t msgh_bits_send = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
- 
- static inline void server_register_wait( semaphore_t sem, unsigned int msgh_id,
--                                        struct msync **wait_objs, const int count )
-+                                         struct msync **wait_objs, const int count )
- {
-     int i, is_mutex;
-     mach_msg_return_t mr;
-@@ -358,7 +357,7 @@ static inline void server_register_wait( semaphore_t sem, unsigned int msgh_id,
- }
- 
- static inline void server_remove_wait( semaphore_t sem, unsigned int msgh_id,
--                                        struct msync **wait_objs, const int count )
-+                                       struct msync **wait_objs, const int count )
- {
-     int i;
-     mach_msg_return_t mr;
-@@ -381,47 +380,51 @@ static inline void server_remove_wait( semaphore_t sem, unsigned int msgh_id,
-         ERR("Failed to send server remove wait: %#x\n", mr);
- }
- 
--static NTSTATUS msync_wait_multiple( struct msync **wait_objs,
--                                     int count, ULONGLONG *end )
-+static inline int check_shm_contention( struct msync **wait_objs,
-+                                        int count, int tid )
- {
--    int i, val, tid;
--    semaphore_t *sem;
--    kern_return_t kr;
--    LONGLONG timeleft;
--    unsigned int msgh_id;
-+    int i, val;
- 
--    resize_wait_objs( wait_objs, &count );
--
--    tid = GetCurrentThreadId();
-     for (i = 0; i < count; i++)
-     {
-         val = __atomic_load_n((int *)wait_objs[i]->shm, __ATOMIC_SEQ_CST);
-         if (wait_objs[i]->type == MSYNC_MUTEX)
-         {
--            if (val == 0 || val == ~0 || val == tid) return STATUS_PENDING;
-+            if (val == 0 || val == ~0 || val == tid) return 1;
-         }
-         else
-         {
--            if (val != 0)  return STATUS_PENDING;
-+            if (val != 0)  return 1;
-         }
-     }
-+    return 0;
-+}
-+
-+static NTSTATUS msync_wait_multiple( struct msync **wait_objs,
-+                                     int count, ULONGLONG *end )
-+{
-+    int tid;
-+    semaphore_t *sem;
-+    kern_return_t kr;
-+    unsigned int msgh_id;
-+    __thread static struct msync *objs[MAXIMUM_WAIT_OBJECTS + 1];
-+
-+    count = resize_wait_objs( wait_objs, objs, count );
-+
-+    tid = GetCurrentThreadId();
-+
-+    if (check_shm_contention( objs, count, tid ))
-+        return STATUS_PENDING;
- 
-     sem = semaphore_pool_alloc();
-     msgh_id = (tid << 8) | count;
--    server_register_wait( *sem, msgh_id, wait_objs, count );
-+    server_register_wait( *sem, msgh_id, objs, count );
- 
-     do
-     {
-         if (end)
--        {
--            timeleft = update_timeout( *end );
--            if (!timeleft)
--            {
--                kr = KERN_OPERATION_TIMED_OUT;
--                break;
--            }
--            kr = semaphore_timedwait( *sem, convert_to_mach_time( timeleft ) );
--        }
-+            kr = semaphore_timedwait( *sem,
-+                        convert_to_mach_time( update_timeout( *end ) ) );
-         else
-             kr = semaphore_wait( *sem );
-     } while (kr == KERN_ABORTED);
-@@ -431,24 +434,25 @@ static NTSTATUS msync_wait_multiple( struct msync **wait_objs,
-     switch (kr) {
-         case KERN_SUCCESS:
-             if (count > 1)
--                server_remove_wait( *sem, msgh_id, wait_objs, count );
-+                server_remove_wait( *sem, msgh_id, objs, count );
-             return STATUS_SUCCESS;
-         case KERN_OPERATION_TIMED_OUT:
--            server_remove_wait( *sem, msgh_id, wait_objs, count );
-+            server_remove_wait( *sem, msgh_id, objs, count );
-+            if (check_shm_contention( objs, count, tid ))
-+                return STATUS_PENDING;
-             return STATUS_TIMEOUT;
-         case KERN_TERMINATED:
--            server_remove_wait( *sem, msgh_id, wait_objs, count );
-+            server_remove_wait( *sem, msgh_id, objs, count );
-             if (end)
-             {
--                timeleft = update_timeout( *end );
--                usleep(timeleft / 10);
-+                usleep( update_timeout( *end ) / 10 );
-                 return STATUS_TIMEOUT;
-             }
-             pause();
-             return STATUS_PENDING;
-         default:
--            server_remove_wait( *sem, msgh_id, wait_objs, count );
--            ERR("Unexpected kernel return code: %#x %s\n", kr, mach_error_string(kr));
-+            server_remove_wait( *sem, msgh_id, objs, count );
-+            ERR("Unexpected kernel return code: %#x %s\n", kr, mach_error_string( kr ));
-             return STATUS_PENDING;
-     }
- }
-@@ -1072,7 +1076,7 @@ static NTSTATUS __msync_wait_objects( DWORD count, const HANDLE *handles,
- {
-     static const LARGE_INTEGER zero = {0};
- 
--    struct msync *objs[MAXIMUM_WAIT_OBJECTS + 1];
-+    __thread static struct msync *objs[MAXIMUM_WAIT_OBJECTS + 1];
-     struct msync apc_obj;
-     int has_msync = 0, has_server = 0;
-     BOOL msgwait = FALSE;
--- 
-2.39.2 (Apple Git-144)
-
-
-From c2129f1ad5f5c1e68f80a04085ccb0af56104e46 Mon Sep 17 00:00:00 2001
-From: Marc-Aurel Zent <marc_aurel@me.com>
-Date: Mon, 16 Oct 2023 12:11:22 +0200
-Subject: [PATCH] correctly reset thread apc
-
----
- server/thread.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/server/thread.c b/server/thread.c
-index 114dec70652..294cc16d96e 100644
---- a/server/thread.c
-+++ b/server/thread.c
-@@ -239,6 +239,7 @@ static inline void init_thread_structure( struct thread *thread )
-     thread->esync_fd        = -1;
-     thread->esync_apc_fd    = -1;
-     thread->msync_idx       = 0;
-+    thread->msync_apc_idx   = 0;
-     thread->system_regs     = 0;
-     thread->queue           = NULL;
-     thread->wait            = NULL;
-@@ -1260,7 +1261,7 @@ static struct thread_apc *thread_dequeue_apc( struct thread *thread, int system
-     }
- 
-     if (do_msync() && list_empty( &thread->system_apc ) && list_empty( &thread->user_apc ))
--        msync_clear( &thread->obj );
-+        msync_clear_shm( thread->msync_apc_idx );
- 
-     if (do_esync() && list_empty( &thread->system_apc ) && list_empty( &thread->user_apc ))
-         esync_clear( thread->esync_apc_fd );
--- 
-2.39.2 (Apple Git-144)
-
-
-From ba8d3b9601e60c27a306712e671911fd3ba57ebf Mon Sep 17 00:00:00 2001
-From: Marc-Aurel Zent <marc_aurel@me.com>
-Date: Tue, 17 Oct 2023 10:47:57 +0200
-Subject: [PATCH] seperate is_used data from sem_list
-
----
- server/msync.c | 17 ++++++++++++-----
- 1 file changed, 12 insertions(+), 5 deletions(-)
-
-diff --git a/server/msync.c b/server/msync.c
-index f066973f..2c955560 100644
---- a/server/msync.c
-+++ b/server/msync.c
-@@ -202,15 +202,22 @@ static inline void pool_free( struct sem_node *node )
- struct sem_list
- {
-     struct sem_node *head;
--    int is_used;
- };
- 
- static struct sem_list mach_semaphore_map[MAX_INDEX];
- 
-+static char is_index_used[MAX_INDEX];
-+
- static inline void add_sem( unsigned int shm_idx, semaphore_t sem, int tid )
- {
-     struct sem_node *new_node;
-     struct sem_list *list = mach_semaphore_map + shm_idx;
-+    
-+    if (!__atomic_load_n(&is_index_used[shm_idx], __ATOMIC_SEQ_CST))
-+    {
-+        fprintf( stderr, "msync: warning: trying to add semaphore to unused index\n" );
-+        return;
-+    }
- 
-     new_node = pool_alloc();
-     new_node->sem = sem;
-@@ -249,7 +256,7 @@ static inline void destroy_all_internal( unsigned int shm_idx )
- 
-     current = list->head;
-     list->head = NULL;
--    __atomic_store_n( &list->is_used, 0, __ATOMIC_SEQ_CST );
-+    __atomic_store_n( &is_index_used[shm_idx], 0, __ATOMIC_SEQ_CST );
- 
-     while (current)
-     {
-@@ -514,7 +521,7 @@ void msync_init(void)
- 
-     pagesize = sysconf( _SC_PAGESIZE );
- 
--    mach_semaphore_map[0].is_used = 1;
-+    is_index_used[0] = 1;
-     shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
-     shm_addrs_size = 128;
- 
-@@ -693,7 +700,7 @@ unsigned int msync_alloc_shm( int low, int high )
- 
-     shm_idx = shm_idx_counter;
- 
--    while (__atomic_load_n( &mach_semaphore_map[shm_idx].is_used, __ATOMIC_SEQ_CST ))
-+    while (__atomic_load_n( &is_index_used[shm_idx], __ATOMIC_SEQ_CST ))
-     {
-         shm_idx = (shm_idx + 1) % MAX_INDEX;
-         if (tries++ > MAX_INDEX)
-@@ -704,7 +711,7 @@ unsigned int msync_alloc_shm( int low, int high )
-             fatal_error("too many msync objects\n");
-         }
-     }
--    __atomic_store_n( &mach_semaphore_map[shm_idx].is_used, 1, __ATOMIC_SEQ_CST );
-+    __atomic_store_n( &is_index_used[shm_idx], 1, __ATOMIC_SEQ_CST );
-     assert(mach_semaphore_map[shm_idx].head == NULL);
-     shm_idx_counter = (shm_idx + 1) % MAX_INDEX;
- 
 -- 
 2.39.2 (Apple Git-144)
 
