@@ -5303,3 +5303,80 @@ index 114dec70652..294cc16d96e 100644
 -- 
 2.39.2 (Apple Git-144)
 
+
+From ba8d3b9601e60c27a306712e671911fd3ba57ebf Mon Sep 17 00:00:00 2001
+From: Marc-Aurel Zent <marc_aurel@me.com>
+Date: Tue, 17 Oct 2023 10:47:57 +0200
+Subject: [PATCH] seperate is_used data from sem_list
+
+---
+ server/msync.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/server/msync.c b/server/msync.c
+index f066973f..2c955560 100644
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -202,15 +202,22 @@ static inline void pool_free( struct sem_node *node )
+ struct sem_list
+ {
+     struct sem_node *head;
+-    int is_used;
+ };
+ 
+ static struct sem_list mach_semaphore_map[MAX_INDEX];
+ 
++static char is_index_used[MAX_INDEX];
++
+ static inline void add_sem( unsigned int shm_idx, semaphore_t sem, int tid )
+ {
+     struct sem_node *new_node;
+     struct sem_list *list = mach_semaphore_map + shm_idx;
++    
++    if (!__atomic_load_n(&is_index_used[shm_idx], __ATOMIC_SEQ_CST))
++    {
++        fprintf( stderr, "msync: warning: trying to add semaphore to unused index\n" );
++        return;
++    }
+ 
+     new_node = pool_alloc();
+     new_node->sem = sem;
+@@ -249,7 +256,7 @@ static inline void destroy_all_internal( unsigned int shm_idx )
+ 
+     current = list->head;
+     list->head = NULL;
+-    __atomic_store_n( &list->is_used, 0, __ATOMIC_SEQ_CST );
++    __atomic_store_n( &is_index_used[shm_idx], 0, __ATOMIC_SEQ_CST );
+ 
+     while (current)
+     {
+@@ -514,7 +521,7 @@ void msync_init(void)
+ 
+     pagesize = sysconf( _SC_PAGESIZE );
+ 
+-    mach_semaphore_map[0].is_used = 1;
++    is_index_used[0] = 1;
+     shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
+     shm_addrs_size = 128;
+ 
+@@ -693,7 +700,7 @@ unsigned int msync_alloc_shm( int low, int high )
+ 
+     shm_idx = shm_idx_counter;
+ 
+-    while (__atomic_load_n( &mach_semaphore_map[shm_idx].is_used, __ATOMIC_SEQ_CST ))
++    while (__atomic_load_n( &is_index_used[shm_idx], __ATOMIC_SEQ_CST ))
+     {
+         shm_idx = (shm_idx + 1) % MAX_INDEX;
+         if (tries++ > MAX_INDEX)
+@@ -704,7 +711,7 @@ unsigned int msync_alloc_shm( int low, int high )
+             fatal_error("too many msync objects\n");
+         }
+     }
+-    __atomic_store_n( &mach_semaphore_map[shm_idx].is_used, 1, __ATOMIC_SEQ_CST );
++    __atomic_store_n( &is_index_used[shm_idx], 1, __ATOMIC_SEQ_CST );
+     assert(mach_semaphore_map[shm_idx].head == NULL);
+     shm_idx_counter = (shm_idx + 1) % MAX_INDEX;
+ 
+-- 
+2.39.2 (Apple Git-144)
+
