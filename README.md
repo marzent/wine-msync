@@ -65,11 +65,11 @@ For incorrect behaviour logs with at least ```+seh,+pid,+msync,+timestamp``` are
 
 System: M2 Max with a CX23 based wine build.
 
-|Test Description|msync|esync|Server-side sync|
-|---|---|---|---|
-|Contended wait (10000000 iterations, 2 threads)|3.792806 seconds|7.423686 seconds|&gt; 170 seconds|
-|zigzag test (2 seconds timeout, 2 threads)|401605 iterations|222675 iterations|60309 iterations|
-|FFXIV indoors, CPU bound|219 FPS|145 FPS|93 FPS|
+|Test Description|msync (with ulock)|msync|esync|Server-side sync|
+|---|---|---|---|---|
+|Contended wait (10000000 iterations, 2 threads)|3.792806 seconds|5.891094 seconds|7.423686 seconds|&gt; 170 seconds|
+|zigzag test (2 seconds timeout, 2 threads)|401605 iterations|270545 iterations|222675 iterations|60309 iterations|
+|FFXIV indoors, CPU bound|219 FPS|170 FPS|145 FPS|93 FPS|
 
 ## Acknowledgements
 
