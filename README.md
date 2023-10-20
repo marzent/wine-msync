@@ -79,4 +79,4 @@ Contributions to ```msync``` are welcome, be it in the form of optimizations, bu
 
 ## License & Integration
 
-```msync``` is released under the GPL v3 license, and integration into other open-source projects is very welcome. If you decide to use or integrate ```msync``` into your projects, although not mandatory, a mention or acknowledgment would be appreciated.
+```msync``` is released under the LGPL v2.1 license, and integration into other open-source projects is very welcome. If you decide to use or integrate ```msync``` into your projects, although not mandatory, a mention or acknowledgment would be appreciated.
