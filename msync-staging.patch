@@ -5462,3 +5462,43 @@ index bd5d5203e3a..ceb64c971a0 100644
 -- 
 2.39.2 (Apple Git-144)
 
+
+From c4a649c02af2a936fba8f2f331216f8118cd5519 Mon Sep 17 00:00:00 2001
+From: Marc-Aurel Zent <mzent@codeweavers.com>
+Date: Sun, 12 Nov 2023 20:53:59 +0100
+Subject: Fix thread QoS tier.
+
+---
+ server/msync.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/server/msync.c b/server/msync.c
+index 1e8186aaa4a..f0aa6480069 100644
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -476,19 +476,19 @@ static void set_thread_policy_qos( mach_port_t mach_thread_id )
+     int throughput_qos, latency_qos;
+     kern_return_t kr;
+ 
+-    latency_qos = LATENCY_QOS_TIER_5;
++    latency_qos = LATENCY_QOS_TIER_0;
+     kr = thread_policy_set( mach_thread_id, THREAD_LATENCY_QOS_POLICY,
+                             (thread_policy_t)&latency_qos,
+                             THREAD_LATENCY_QOS_POLICY_COUNT);
+     if (kr != KERN_SUCCESS)
+-        fprintf(stderr, "msync: error setting thread latency QoS.");
++        fprintf( stderr, "msync: error setting thread latency QoS.\n" );
+ 
+-    throughput_qos = THROUGHPUT_QOS_TIER_5;
++    throughput_qos = THROUGHPUT_QOS_TIER_0;
+     kr = thread_policy_set( mach_thread_id, THREAD_THROUGHPUT_QOS_POLICY,
+                             (thread_policy_t)&throughput_qos,
+                             THREAD_THROUGHPUT_QOS_POLICY_COUNT);
+     if (kr != KERN_SUCCESS)
+-        fprintf(stderr, "msync: error setting thread throughput QoS.");
++        fprintf( stderr, "msync: error setting thread throughput QoS.\n" );
+ 
+     extended_policy.timeshare = 0;
+     kr = thread_policy_set( mach_thread_id, THREAD_EXTENDED_POLICY,
+-- 
+GitLab
