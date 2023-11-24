@@ -1,6 +1,6 @@
 # msync
 
-```msync``` is a wine patch set utilizing [Mach](https://web.mit.edu/darwin/src/modules/xnu/osfmk/man/) semaphores to provide efficient NT-synchronization primitive emulation for Wine on macOS.
+```msync``` is a wine patch set utilizing [Mach](https://web.mit.edu/darwin/src/modules/xnu/osfmk/man/) semaphores and (if available) the ulock kernel interface to provide efficient NT-synchronization primitive emulation for Wine on macOS.
 
 It draws inspiration from ```esync``` and ```fsync```, particularly relying on shared memory code from ```fsync```.
 
@@ -53,6 +53,8 @@ A signal operation is a Mach message for wineserver, which will look up the obje
 
 Races should effectively be not possible (at least I am trying to assure myself of that), since the registration and signaling happen on the same Mach port, and the message queue is supposed to be sequentially consistent across all processes. Additionally, before registration (and most likely after the client started its wait), the server rechecks the waiting condition, similar to futexes. Even if the client is preempted for a long time there and hasn't started its wait, the semaphore will be in a signaled state whenever it does.
 
+Additionally, if available `__ulock_wait2` is used to relieve some load from the servers message handling, allowing single wait cases to have better-than-NT performance. 
+
 ## Bugs
 
 Please report any discovered bugs. A primary aim for ```msync``` was to enhance performance over simulated ```eventfd``` objects on macOS. If ```esync``` has better performance in any situation, that's considered a bug.
@@ -63,11 +65,11 @@ For incorrect behaviour logs with at least ```+seh,+pid,+msync,+timestamp``` are
 
 System: M2 Max with a CX23 based wine build.
 
-|Test Description|msync|esync|Server-side sync|
-|---|---|---|---|
-|Contended wait (10000000 iterations, 2 threads)|5.891094 seconds|7.423686 seconds|&gt; 170 seconds|
-|zigzag test (2 seconds timeout, 2 threads)|270545 iterations|222675 iterations|60309 iterations|
-|FFXIV indoors, CPU bound|170 FPS|145 FPS|93 FPS|
+|Test Description|msync (with ulock)|msync|esync|Server-side sync|
+|---|---|---|---|---|
+|Contended wait (10000000 iterations, 2 threads)|3.792806 seconds|5.891094 seconds|7.423686 seconds|&gt; 170 seconds|
+|zigzag test (2 seconds timeout, 2 threads)|401605 iterations|270545 iterations|222675 iterations|60309 iterations|
+|FFXIV indoors, CPU bound|219 FPS|170 FPS|145 FPS|93 FPS|
 
 ## Acknowledgements
 
