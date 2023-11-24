@@ -5509,3 +5509,71 @@ index 1e8186aaa4a..f0aa6480069 100644
      kr = thread_policy_set( mach_thread_id, THREAD_EXTENDED_POLICY,
 -- 
 GitLab
+
+
+From 8cae954df7d93a75fab53b9a69d941fdb36c7ab1 Mon Sep 17 00:00:00 2001
+From: Marc-Aurel Zent <mzent@codeweavers.com>
+Date: Fri, 24 Nov 2023 19:10:29 +0300
+Subject: [PATCH] ignore interrupts on ulock waits
+
+---
+ dlls/ntdll/unix/msync.c | 33 +++++++++++++++++----------------
+ 1 file changed, 17 insertions(+), 16 deletions(-)
+
+diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
+index 1d0701ddde9..7f35b99dd05 100644
+--- a/dlls/ntdll/unix/msync.c
++++ b/dlls/ntdll/unix/msync.c
+@@ -388,7 +388,7 @@ static inline void server_remove_wait( semaphore_t sem, unsigned int msgh_id,
+         ERR("Failed to send server remove wait: %#x\n", mr);
+ }
+ 
+-static inline NTSTATUS destroyed_wait( ULONGLONG *end )
++static NTSTATUS destroyed_wait( ULONGLONG *end )
+ {
+     if (end)
+     {
+@@ -417,24 +417,25 @@ static inline NTSTATUS msync_wait_single( struct msync *wait_obj,
+     void *addr = wait_obj->shm;
+     ULONGLONG ns_timeleft = 0;
+ 
+-    if (wait_obj->type == MSYNC_MUTEX)
++    do 
+     {
+-        val = __atomic_load_n( (int *)addr, __ATOMIC_ACQUIRE );
+-        if (!val)
+-            val = GetCurrentThreadId();
+-        else if (val == ~0)
+-            val = GetCurrentThreadId();
+-    }
++        if (wait_obj->type == MSYNC_MUTEX)
++        {
++            val = __atomic_load_n( (int *)addr, __ATOMIC_ACQUIRE );
++            if (!val || val == ~0)
++                val = GetCurrentThreadId();
++        }
+ 
+-    if (__atomic_load_n( (int *)addr, __ATOMIC_ACQUIRE ) != val)
+-        return STATUS_PENDING;
++        if (__atomic_load_n( (int *)addr, __ATOMIC_ACQUIRE ) != val)
++            return STATUS_PENDING;
+ 
+-    if (end)
+-    {
+-        ns_timeleft = update_timeout( *end ) * 100;
+-        if (!ns_timeleft) return STATUS_TIMEOUT;
+-    }
+-    ret = __ulock_wait2( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, val, ns_timeleft, 0 );
++        if (end)
++        {
++            ns_timeleft = update_timeout( *end ) * 100;
++            if (!ns_timeleft) return STATUS_TIMEOUT;
++        }
++        ret = __ulock_wait2( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, val, ns_timeleft, 0 );
++    } while (ret == -EINTR);
+ 
+     if (ret == -ETIMEDOUT)
+         return STATUS_TIMEOUT;
+-- 
+2.39.3 (Apple Git-145)
+
