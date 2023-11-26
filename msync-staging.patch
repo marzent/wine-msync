@@ -2184,8 +2184,8 @@ index dc8a5620fd8..2ee254eb9be 100644
  
  /* ### protocol_version begin ### */
  
--#define SERVER_PROTOCOL_VERSION 784
-+#define SERVER_PROTOCOL_VERSION 785
+-#define SERVER_PROTOCOL_VERSION 785
++#define SERVER_PROTOCOL_VERSION 786
  
  /* ### protocol_version end ### */
  
